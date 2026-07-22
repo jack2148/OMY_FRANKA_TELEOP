@@ -1,0 +1,12 @@
+open_manipulator_omy/
+robotis_mujoco_menagerie/
+mujoco_menagerie/
+
+build/
+install/
+log/
+__pycache__/
+*.pyc
+
+.agents/
+.codex/
