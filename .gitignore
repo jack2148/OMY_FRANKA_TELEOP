@@ -10,3 +10,5 @@ __pycache__/
 
 .agents/
 .codex/
+*.mp4
+*.webm
