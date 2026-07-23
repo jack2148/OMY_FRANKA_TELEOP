@@ -25,7 +25,6 @@ ROS_JOINTS = [
     "joint4",
     "joint5",
     "joint6",
-    "rh_r1_joint",
 ]
 
 
@@ -36,7 +35,6 @@ MUJOCO_ACTUATORS = [
     "Joint4",
     "Joint5",
     "Joint6",
-    "Gripper",
 ]
 
 
@@ -85,6 +83,8 @@ def main():
         model.actuator(name).id
         for name in MUJOCO_ACTUATORS
     ]
+    omy_ee_site_id = model.site("omy_ee_site").id
+    last_print_time = 0.0
 
     with mujoco.viewer.launch_passive(model, data) as viewer:
         while viewer.is_running() and rclpy.ok():
@@ -93,6 +93,15 @@ def main():
                     data.ctrl[actuator_id] = target_positions[i]
 
             mujoco.mj_step(model, data)
+            now = time.time()
+            if now - last_print_time >= 0.1:  # 10 Hz 출력
+                ee_position = data.site_xpos[omy_ee_site_id].copy()
+                ee_rotation = data.site_xmat[omy_ee_site_id].reshape(3, 3).copy() 
+
+                print("OMY EE position:", ee_position)
+                print("OMY EE rotation:\n", ee_rotation)  #실시간 EE poses 출력
+
+                last_print_time = now
             viewer.sync()
             time.sleep(0.002)
 
