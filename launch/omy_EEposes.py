@@ -29,5 +29,7 @@ if omy_ee_site_id < 0:
 p_omy_0 = data.site_xpos[omy_ee_site_id].copy()
 R_omy_0 = data.site_xmat[omy_ee_site_id].reshape(3, 3).copy()
 
+omy_home = (p_omy_0, R_omy_0)
+
 print("OMY initial position:", p_omy_0)
 print("OMY initial rotation:\n", R_omy_0)

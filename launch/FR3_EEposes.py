@@ -39,5 +39,6 @@ if fr3_ee_site_id < 0:
 p_fr3_0 = data.site_xpos[fr3_ee_site_id].copy()
 R_fr3_0 = data.site_xmat[fr3_ee_site_id].reshape(3, 3).copy()
 
+fr3_home = (p_fr3_0, R_fr3_0)
 print("FR3 initial position:", p_fr3_0)
 print("FR3 initial rotation:\n", R_fr3_0)
