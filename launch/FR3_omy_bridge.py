@@ -286,7 +286,7 @@ def main():
 
                 now = time.monotonic()
                 if now - last_print_time >= 0.2:
-                    target_error = np.linalg.norm(position_error)
+                    tracking_error = np.linalg.norm(position_error)
                     return_error = np.linalg.norm(
                         fr3_current_position - fr3_initial_position
                     )
@@ -300,7 +300,7 @@ def main():
                     print("Position error:", position_error)
                     print("FR3 q current:", q_current)
                     print("FR3 q command:", fr3_q_command)
-                    print(f"tracking error: {target_error * 1000:.2f} mm")
+                    print(f"tracking error: {tracking_error * 1000:.2f} mm")
                     print(f"return error: {return_error * 1000:.2f} mm")
                     print(f"max joint step: {max_joint_step:.6f} rad")
                     last_print_time = now
