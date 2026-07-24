@@ -25,6 +25,22 @@ FR3_MODEL_PATH = ROOT / "mujoco_menagerie" / "franka_fr3" / "scene.xml"
 
 OMY_ROS_JOINTS = [f"joint{i}" for i in range(1, 7)]
 OMY_MUJOCO_JOINTS = [f"Joint{i}" for i in range(1, 7)]
+TRIGGER_JOINT = "rh_r1_joint"
+# Inward pull is assumed to move rh_r1_joint toward the lower position.
+# Hysteresis: lower value turns position mode on, higher value turns it off.
+TRIGGER_ON_THRESHOLD = -0.9
+TRIGGER_OFF_THRESHOLD = -0.7
+
+# Position-only DLS IK. Orientation tracking remains disabled.
+AXIS_MAP = np.array([
+    [0.0, 1.0, 0.0],
+    [-1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0],
+])
+POSITION_SCALE = 0.2
+IK_DAMPING = 0.05
+IK_GAIN = 0.05
+MAX_DQ = 0.002
 
 
 class OmyPose(Node):
@@ -35,6 +51,8 @@ class OmyPose(Node):
         self.target_positions = target_positions
         self.target_lock = target_lock
         self.last_message_time = 0.0
+        self.now_joint_state = False
+        self.trigger_position = 0.0
 
         self.subscription = self.create_subscription(
             JointState,
@@ -46,11 +64,17 @@ class OmyPose(Node):
     def joint_state_callback(self, message):
         received = dict(zip(message.name, message.position))
 
+        required_joints = OMY_ROS_JOINTS + [TRIGGER_JOINT]
+        if not all(name in received for name in required_joints):
+            return
+
         with self.target_lock:
             for index, joint_name in enumerate(OMY_ROS_JOINTS):
-                if joint_name in received:
-                    self.target_positions[index] = received[joint_name]
+                self.target_positions[index] = received[joint_name]
+
+            self.trigger_position = received[TRIGGER_JOINT]
             self.last_message_time = time.monotonic()
+            self.now_joint_state = True
 
 
 def keyframe_id(model, name):
@@ -73,73 +97,18 @@ def read_site_pose(data, site):
     return position, rotation
 
 
-def rotation_error(current_rotation, target_rotation):
-    """Return a small-angle rotation error in the world frame."""
-    return 0.5 * (
-        np.cross(current_rotation[:, 0], target_rotation[:, 0])
-        + np.cross(current_rotation[:, 1], target_rotation[:, 1])
-        + np.cross(current_rotation[:, 2], target_rotation[:, 2])
+def draw_target_marker(viewer, position):
+    """Draw one red sphere in the viewer's user scene."""
+    scene = viewer.user_scn
+    scene.ngeom = 1
+    mujoco.mjv_initGeom(
+        scene.geoms[0],
+        mujoco.mjtGeom.mjGEOM_SPHERE,
+        np.array([0.025, 0.0, 0.0]),
+        position,
+        np.eye(3).reshape(-1),
+        np.array([1.0, 0.0, 0.0, 1.0]),
     )
-
-
-def solve_dls_ik(
-    model,
-    data,
-    site,
-    q_seed,
-    target_position,
-    target_rotation,
-    qpos_addresses,
-    dof_addresses,
-    joint_limits,
-    iterations=10,
-    damping=0.05,
-):
-    """Solve a 6D site pose with damped-least-squares IK."""
-    q_solution = q_seed.copy()
-
-    for _ in range(iterations):
-        data.qpos[qpos_addresses] = q_solution
-        mujoco.mj_forward(model, data)
-
-        current_position, current_rotation = read_site_pose(data, site)
-        position_error = target_position - current_position
-        orientation_error = rotation_error(current_rotation, target_rotation)
-        pose_error = np.concatenate((position_error, orientation_error))
-
-        if np.linalg.norm(pose_error) < 1e-4:
-            break
-
-        jac_position = np.zeros((3, model.nv))
-        jac_rotation = np.zeros((3, model.nv))
-        mujoco.mj_jacSite(
-            model,
-            data,
-            jac_position,
-            jac_rotation,
-            site,
-        )
-        jacobian = np.vstack((jac_position, jac_rotation))[:, dof_addresses]
-
-        identity = np.eye(6)
-        dq = jacobian.T @ np.linalg.solve(
-            jacobian @ jacobian.T + damping**2 * identity,
-            pose_error,
-        )
-
-        # Limit each iteration so a sudden leader message cannot cause a jump.
-        dq_norm = np.linalg.norm(dq)
-        if dq_norm > 0.08:
-            dq *= 0.08 / dq_norm
-
-        q_solution += 0.8 * dq
-        q_solution = np.clip(
-            q_solution,
-            joint_limits[:, 0],
-            joint_limits[:, 1],
-        )
-
-    return q_solution
 
 
 def main():
@@ -152,7 +121,7 @@ def main():
     mujoco.mj_resetDataKeyframe(omy_model, omy_data, omy_home_id)
     mujoco.mj_forward(omy_model, omy_data)
     omy_ee_site_id = site_id(omy_model, "omy_ee_site")
-    omy_home_position, omy_home_rotation = read_site_pose(
+    omy_home_position, _ = read_site_pose(
         omy_data, omy_ee_site_id
     )
 
@@ -163,28 +132,32 @@ def main():
     mujoco.mj_resetDataKeyframe(fr3_model, fr3_data, fr3_home_id)
     mujoco.mj_forward(fr3_model, fr3_data)
     fr3_ee_site_id = site_id(fr3_model, "attachment_site")
-    fr3_home_position, fr3_home_rotation = read_site_pose(
+    fr3_home_position, _ = read_site_pose(
         fr3_data, fr3_ee_site_id
     )
 
-    fr3_joint_ids = [
-        fr3_model.joint(f"fr3_joint{i}").id
-        for i in range(1, 8)
-    ]
-    fr3_qpos_addresses = np.array(
+    fr3_joint_ids = np.array(
+        [fr3_model.joint(f"fr3_joint{i}").id for i in range(1, 8)],
+        dtype=int,
+    )
+    fr3_qpos_indices = np.array(
         [fr3_model.jnt_qposadr[joint_id] for joint_id in fr3_joint_ids],
         dtype=int,
     )
-    fr3_dof_addresses = np.array(
+    fr3_dof_indices = np.array(
         [fr3_model.jnt_dofadr[joint_id] for joint_id in fr3_joint_ids],
         dtype=int,
     )
-    fr3_joint_limits = fr3_model.jnt_range[fr3_joint_ids].copy()
-    fr3_actuator_ids = np.array(
+    fr3_joint_lower = fr3_model.jnt_range[fr3_joint_ids, 0].copy()
+    fr3_joint_upper = fr3_model.jnt_range[fr3_joint_ids, 1].copy()
+    fr3_actuator_indices = np.array(
         [fr3_model.actuator(f"fr3_joint{i}").id for i in range(1, 8)],
         dtype=int,
     )
-    fr3_ik_data = mujoco.MjData(fr3_model)
+    fr3_home_q = fr3_data.qpos[fr3_qpos_indices].copy()
+    fr3_data.qpos[fr3_qpos_indices] = fr3_home_q.copy()
+    fr3_data.ctrl[fr3_actuator_indices] = fr3_home_q.copy()
+    mujoco.mj_forward(fr3_model, fr3_data)
 
     omy_joint_qpos_addresses = [
         omy_model.jnt_qposadr[omy_model.joint(name).id]
@@ -207,53 +180,129 @@ def main():
 
     last_print_time = 0.0
 
+    # XML home initializes the displayed FR3. The actual reference is captured
+    # on each OFF -> ON trigger edge.
+    position_mode_active = False
+    omy_initial_position = None
+    fr3_initial_position = None
+    fr3_target_position = fr3_home_position.copy()
+    fr3_q_command = fr3_home_q.copy()
+
     try:
         with mujoco.viewer.launch_passive(fr3_model, fr3_data) as viewer:
             while viewer.is_running() and rclpy.ok():
                 with target_lock:
                     omy_target = target_positions.copy()
+                    trigger_position = ros_node.trigger_position
 
                 for address, position in zip(omy_joint_qpos_addresses, omy_target):
                     omy_data.qpos[address] = position
                 mujoco.mj_forward(omy_model, omy_data)
 
-                omy_current_position, omy_current_rotation = read_site_pose(
+                omy_current_position, _ = read_site_pose(
                     omy_data, omy_ee_site_id
                 )
+                if not ros_node.now_joint_state:
+                    fr3_data.ctrl[fr3_actuator_indices] = fr3_q_command
+                    mujoco.mj_step(fr3_model, fr3_data)
+                    viewer.sync()
+                    time.sleep(0.002)
+                    continue
 
-                # Body-frame pose increment from OMY home to current pose.
-                delta_position = omy_current_position - omy_home_position
-                delta_rotation = omy_home_rotation.T @ omy_current_rotation
+                if (
+                    not position_mode_active
+                    and trigger_position <= TRIGGER_ON_THRESHOLD
+                ):
+                    # Capture a new clutch/reference pose exactly when the
+                    # position mode is enabled. Keep it fixed while ON.
+                    omy_initial_position = omy_current_position.copy()
+                    fr3_q_command = fr3_data.ctrl[fr3_actuator_indices].copy()
+                    fr3_initial_position, _ = read_site_pose(
+                        fr3_data, fr3_ee_site_id
+                    )
+                    position_mode_active = True
 
-                # Apply OMY's home-relative motion to the FR3 home pose.
-                fr3_target_position = fr3_home_position + delta_position
-                fr3_target_rotation = fr3_home_rotation @ delta_rotation
+                    print("Position mode ON")
+                    print("Runtime initial OMY EE pose captured")
+                    print("Runtime initial FR3 EE pose captured")
 
-                # Solve FR3's 7-joint configuration for the target EE pose.
-                fr3_ik_data.qpos[:] = fr3_data.qpos
-                fr3_ik_qpos = fr3_ik_data.qpos[fr3_qpos_addresses].copy()
-                fr3_ik_qpos = solve_dls_ik(
-                    fr3_model,
-                    fr3_ik_data,
-                    fr3_ee_site_id,
-                    fr3_ik_qpos,
-                    fr3_target_position,
-                    fr3_target_rotation,
-                    fr3_qpos_addresses,
-                    fr3_dof_addresses,
-                    fr3_joint_limits,
+                elif (
+                    position_mode_active
+                    and trigger_position >= TRIGGER_OFF_THRESHOLD
+                ):
+                    position_mode_active = False
+                    print("Position mode OFF - holding last FR3 target")
+
+                if not position_mode_active:
+                    fr3_data.ctrl[fr3_actuator_indices] = fr3_q_command
+                    mujoco.mj_step(fr3_model, fr3_data)
+                    viewer.sync()
+                    time.sleep(0.002)
+                    continue
+
+                # Keep the validated position target calculation unchanged.
+                delta_position_omy = omy_current_position - omy_initial_position
+                delta_position_fr3 = POSITION_SCALE * (
+                    AXIS_MAP @ delta_position_omy
                 )
+                fr3_target_position = fr3_initial_position + delta_position_fr3
+                draw_target_marker(viewer, fr3_target_position)
 
-                fr3_data.ctrl[fr3_actuator_ids] = fr3_ik_qpos
+                # Position-only DLS IK. Orientation is intentionally ignored.
+                fr3_current_position = fr3_data.site_xpos[fr3_ee_site_id].copy()
+                position_error = fr3_target_position - fr3_current_position
+
+                jacp = np.zeros((3, fr3_model.nv))
+                jacr = np.zeros((3, fr3_model.nv))
+                mujoco.mj_jacSite(
+                    fr3_model,
+                    fr3_data,
+                    jacp,
+                    jacr,
+                    fr3_ee_site_id,
+                )
+                J_pos = jacp[:, fr3_dof_indices]
+
+                regularized = (
+                    J_pos @ J_pos.T
+                    + (IK_DAMPING ** 2) * np.eye(3)
+                )
+                dq = J_pos.T @ np.linalg.solve(
+                    regularized,
+                    position_error,
+                )
+                dq = IK_GAIN * dq
+                dq = np.clip(dq, -MAX_DQ, MAX_DQ)
+                max_joint_step = np.max(np.abs(dq))
+
+                q_current = fr3_data.qpos[fr3_qpos_indices].copy()
+                fr3_q_command = np.clip(
+                    fr3_q_command + dq,
+                    fr3_joint_lower,
+                    fr3_joint_upper,
+                )
+                fr3_data.ctrl[fr3_actuator_indices] = fr3_q_command
                 mujoco.mj_step(fr3_model, fr3_data)
 
                 now = time.monotonic()
                 if now - last_print_time >= 0.2:
+                    target_error = np.linalg.norm(position_error)
+                    return_error = np.linalg.norm(
+                        fr3_current_position - fr3_initial_position
+                    )
                     print("OMY current position:", omy_current_position)
-                    print("OMY delta position:", delta_position)
-                    print("OMY delta rotation:\n", delta_rotation)
+                    print("OMY delta position:", delta_position_omy)
+                    print("FR3 mapped delta position:", delta_position_fr3)
+                    print("Trigger position:", trigger_position)
+                    print("Position mode active:", position_mode_active)
                     print("FR3 target position:", fr3_target_position)
-                    print("FR3 IK qpos:", fr3_ik_qpos)
+                    print("FR3 current position:", fr3_current_position)
+                    print("Position error:", position_error)
+                    print("FR3 q current:", q_current)
+                    print("FR3 q command:", fr3_q_command)
+                    print(f"tracking error: {target_error * 1000:.2f} mm")
+                    print(f"return error: {return_error * 1000:.2f} mm")
+                    print(f"max joint step: {max_joint_step:.6f} rad")
                     last_print_time = now
 
                 viewer.sync()

@@ -1,6 +1,6 @@
-# FR3–OMY EE Pose 구현 기록
+# FR3–OMY Cartesian Teleoperation 개발 기록
 
-작성일: 2026-07-23
+작성일: 2026-07-24
 
 ## 1. 작업 목표
 
@@ -187,3 +187,92 @@ delta_p_omy = p_omy_current - p_omy_initial
 
 잘못된 큰 OMY delta가 FR3 target pose를 시작부터 멀리 이동시켰고, 그 결과 FR3 IK가 joint limit에 포화된 것으로 추정한다.
 
+## 문제 상황
+
+오늘 확인한 runtime initial pose, 좌표축, actuator command 및 진동 문제는 별도 디버깅 문서에 정리하였다.
+
+→ [FR3–OMY EE Pose 디버깅 기록](debugging.md)
+
+## 7. Position-only Cartesian teleoperation MVP
+
+현재 구현은 OMY의 position 3축만 FR3 target position으로 전달하고, FR3 orientation은 고정한다.
+
+```text
+OMY joint state → OMY MuJoCo FK → omy_ee_site position
+→ runtime initial 기준 delta → FR3 target marker
+→ FR3 translational DLS IK → FR3 position actuator
+```
+
+현재 position mapping은 다음과 같다.
+
+```text
+FR3 X =  OMY Y
+FR3 Y = -OMY X
+FR3 Z =  OMY Z
+```
+
+```python
+AXIS_MAP = np.array([
+    [0.0, 1.0, 0.0],
+    [-1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0],
+])
+POSITION_SCALE = 0.2
+```
+
+runtime initial position 기준으로 position target을 계산하고, translational Jacobian만 사용한다. `qpos address`는 관절 상태 접근에 사용하고 `dof address`는 Jacobian column 선택에 사용한다.
+
+현재 DLS 설정:
+
+```python
+IK_DAMPING = 0.05
+IK_GAIN = 0.05
+MAX_DQ = 0.002
+```
+
+실제 관절 상태 `q_current`와 actuator command `fr3_q_command`는 분리한다. command는 이전 command에 `dq`를 누적한다.
+
+nominal control frequency는 `0.002 s` loop 기준 약 `500 Hz`이다.
+
+## 8. 왕복 검증 로그
+
+다음 값을 출력한다.
+
+```text
+tracking error: xx.xx mm
+return error: xx.xx mm
+max joint step: x.xxxxxx rad
+```
+
+왕복 실험은 Trigger ON, 특정 방향 이동, OMY 원위치 복귀 순서로 진행한다. `return_error`는 OMY가 initial pose로 돌아온 뒤 Trigger가 ON인 상태에서 기록한다.
+
+성공 기준은 marker 연속 이동, FR3 EE의 느린 추종, joint limit 비포화, 발산·진동 없음, 작은 return error이다.
+
+**Position-only MVP completed.**
+
+Orientation retargeting and rotational IK are not yet implemented.
+
+## 9. 현재 파라미터 기록
+
+| Parameter | Current value |
+|---|---:|
+| `POSITION_SCALE` | `0.2` |
+| `AXIS_MAP` | `[[0,1,0],[-1,0,0],[0,0,1]]` |
+| `IK_DAMPING` (DLS damping) | `0.05` |
+| `IK_GAIN` | `0.05` |
+| `MAX_DQ` | `0.002 rad/cycle` |
+| control frequency | nominal `500 Hz` |
+
+## 10. 월요일 작업 순서
+
+1. Trigger ON 시 OMY·FR3 runtime initial rotation 저장
+2. OMY relative rotation 계산
+3. operator frame 기준 orientation mapping 정의
+4. FR3 target orientation만 시각화
+5. 회전 방향 단축 검증
+6. rotational Jacobian 추가
+7. 6D DLS IK 적용
+
+회전 target 검증과 실제 6D IK를 한 번에 붙이지 않는다. 먼저 orientation marker가 올바른 방향으로 움직이는지 확인한다.
+
+월요일 목표는 OMY relative rotation을 FR3 target orientation으로 변환하고 시각적으로 검증하는 것이다. target orientation이 완전히 맞을 때만 6D IK를 추가한다.
