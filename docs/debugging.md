@@ -1,7 +1,7 @@
 # FR3–OMY Cartesian Teleoperation 디버깅 기록
 
 최초 작성: 2026-07-24
-최종 수정: 2026-07-24
+최종 수정: 2026-07-27
 
 개발 문서: [FR3–OMY Cartesian Teleoperation 개발 기록](development.md)
 

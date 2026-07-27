@@ -1,7 +1,13 @@
-# FR3–OMY Cartesian Teleoperation 개발 기록
+# FR3–OMY Cartesian Teleoperation Development Log
 
 최초 작성: 2026-07-23<br>
-최종 수정: 2026-07-24
+최종 수정: 2026-07-27
+
+> Current status: 6D position-orientation teleoperation is operational in MuJoCo, while target-based clutch re-anchoring and standardized quantitative evaluation remain incomplete.
+
+## Phase 1 — Position-only Cartesian Teleoperation
+
+Status: Completed on 2026-07-24
 
 ## 1. 목표 및 현재 결과
 
@@ -339,7 +345,9 @@ max_joint_step = np.max(np.abs(dq))
 
 `500 Hz`는 configured loop period에서 계산한 nominal frequency이며, 실제 control frequency는 MuJoCo step 시간과 시스템 부하에 따라 달라질 수 있다.
 
-# OMY–FR3 6D Cartesian Teleoperation Development
+## Phase 2 — 6D Cartesian Teleoperation
+
+Status: In progress on 2026-07-27
 
 ## 1. 작업 목표
 
@@ -463,7 +471,7 @@ fr3_initial_position, fr3_initial_rotation = read_site_pose(
 
 ## 5. 최초 결과
 
-![Initial 6D teleoperation tracking](../logs/orientation_teleop.png)
+![Initial 6D teleoperation tracking](images/teleop/development/initial_6d_tracking.png)
 
 초기 plot에는 다음 네 값이 표시된다.
 
@@ -476,7 +484,7 @@ fr3_initial_position, fr3_initial_rotation = read_site_pose(
 
 ## 6. 최종 결과
 
-![Final 6D teleoperation tracking](../logs/MAX_DQ_0.004_v2.png)
+![Final 6D teleoperation tracking](images/teleop/development/final_6d_tracking.png)
 
 `logs/MAX_DQ_0.004_v2.csv` 기준으로 확인된 값은 position error peak 약 `7.78 mm`, orientation tracking error peak 약 `10.02 deg`, maximum joint step `0.004 rad`이다. 그래프에서는 OMY와 FR3 target orientation이 대체로 같은 방향으로 생성되고, FR3 actual orientation은 빠른 구간에서 lag를 보인 뒤 target을 따라간다.
 
