@@ -9,6 +9,10 @@
 
 Status: Completed on 2026-07-24
 
+![Position-only Cartesian teleoperation](images/teleop/development/position_only_cartesian_teleoperation.gif)
+
+위 GIF는 orientation retargeting과 rotational IK를 연결하기 전, 현재 기준으로 보존한 position-only Cartesian teleoperation 동작을 보여준다.
+
 ## 1. 목표 및 현재 결과
 
 이 시스템의 목표는 실제 OMY-L100 리더암의 ROS joint state를 MuJoCo OMY 모델에 적용하고, OMY EE의 Cartesian position 변화를 FR3 MuJoCo의 target position으로 전달하는 것이다.
