@@ -382,3 +382,236 @@ max joint step: 0.000002 rad
 * DLS damping, IK gain, joint-step limit을 한 번에 하나씩 조정한다.
 * Position-only DLS IK를 안정화한 뒤 orientation retargeting을 검증한다.
 * Orientation target 검증 없이 rotational Jacobian과 6D IK를 동시에 추가하지 않는다.
+
+# OMY–FR3 6D Teleoperation Debugging Log
+
+## 1. Debugging objective
+
+2026-07-27 디버깅의 목적은 orientation을 포함한 6D IK에서 발생하는 오차를 OMY relative motion, FR3 target generation, FR3 actual tracking, clutch discontinuity, MAX_DQ saturation으로 분리하는 것이었다. 각 plot은 구현 요약이 아니라 당시의 configuration, 관찰 증거, 다음 가설을 남기는 decision log로 사용한다.
+
+## 2. Initial configuration
+
+공통 parameter는 다음과 같다.
+
+POSITION_SCALE = 0.7
+IK_DAMPING = 0.05
+IK_GAIN = 0.05
+ROTATION_IK_WEIGHT = 0.1
+
+MAX_DQ는 실험마다 달랐다. 공통 debug 항목은 OMY current/delta position, OMY relative rotation vector/angle, FR3 target/current position, position error, FR3 rotation error vector/angle, OMY/FR3 target/FR3 actual orientation, q_current, q_command, maximum joint step이다. 현재 working tree에서는 ENABLE_CSV_LOGGING = False로 새 CSV 기록이 비활성화되어 있다.
+
+## 3. Diagnostic principle
+
+세 상대 회전을 같은 runtime reference 기준으로 분리했다.
+
+1. OMY relative rotation
+2. FR3 target rotation
+3. FR3 actual rotation
+
+R_omy_rel = R_omy_initial.T @ R_omy_current
+R_target_rel = R_fr3_initial.T @ R_fr3_target
+R_actual_rel = R_fr3_initial.T @ R_fr3_current
+R_tracking_error = R_fr3_target @ R_fr3_current.T
+
+OMY != target이면 mapping/target generation, OMY ≈ target인데 actual이 다르면 IK/controller tracking, rising edge의 target jump는 clutch anchor, maximum joint step의 상한 고정은 command saturation으로 분류했다. 회전 오차는 Euler component difference가 아니라 rotation matrix를 rotation vector로 변환한 norm으로 평가했다.
+
+## Experiment 1 — Initial orientation tracking
+
+### Plot
+
+![Initial orientation tracking](images/teleop/debugging/01_initial_orientation_tracking.png)
+
+### Configuration
+
+POSITION_SCALE = 0.7
+IK_DAMPING = 0.05
+IK_GAIN = 0.05
+ROTATION_IK_WEIGHT = 0.1
+MAX_DQ = 0.002 rad/cycle
+
+### Observed symptom / Hypotheses
+
+OMY와 FR3 target은 일부 구간에서 비슷한 회전 크기를 보였지만 FR3 actual은 빠른 구간에서 lag/overshoot를 보였다. position/orientation spike와 session 간 timestamp gap을 연결한 plot artifact도 있었다. 가설은 orientation axis mapping, rotation scale, DLS gain/damping, joint-step saturation, trigger 기준 pose 불일치였다.
+
+### Diagnostic evidence / Decision
+
+logs/orientation_teleop.csv 전체에서 position error peak는 약 756.5 mm, orientation error peak는 약 90.0 deg, maximum joint step은 0.004 rad였다. 여러 session이 섞였을 가능성이 있어 diagnostic maximum으로만 취급한다. OMY relative와 target이 일치하는 구간이 있으므로 scale을 즉시 바꾸지 않고 target/actual/error를 분리해 기록하기로 했다.
+
+## Experiment 2 — MAX_DQ adjustment before complete anchor fix
+
+### Plot
+
+![MAX_DQ 0.004 before anchor diagnosis](images/teleop/debugging/02_max_dq_0004_before_anchor_fix.png)
+
+### Configuration / Change
+
+공통 parameter는 Experiment 1과 같고 MAX_DQ = 0.004 rad/cycle로 올렸다. 기대한 효과는 tracking bandwidth 증가와 빠른 target에 대한 lag 감소였다.
+
+### Result / Interpretation
+
+오차 spike가 계속되고 maximum joint step이 상한에 반복적으로 붙었다. 일부 구간에서는 position이 수십~수백 mm, orientation이 수십 deg까지 변했고 target 자체도 큰 각도와 작은 각도 사이에서 불연속적으로 보였다. 따라서 MAX_DQ 부족만으로 설명하지 않고 target continuity와 clutch 기준을 먼저 확인하기로 했다.
+
+## Experiment 3 — Clutch anchor frame diagnosis
+
+### Symptom / Root cause hypothesis
+
+OMY와 FR3가 이미 약 30 deg 회전한 뒤 Trigger를 재입력할 때 OMY current만 새 기준이 되고 FR3 target이 최초 runtime 기준에 남으면, 상대 motion이 0이어도 target이 이전 자세에서 작은 각도로 점프할 수 있다. 이 discontinuity가 position/orientation spike와 joint-step saturation을 만들 수 있다.
+
+### Fix definition
+
+의도된 fix는 rising edge에서 anchor pair를 함께 저장하는 것이다.
+
+R_omy_anchor = R_omy_current.copy()
+R_fr3_anchor = R_fr3_target.copy()
+R_omy_rel = R_omy_anchor.T @ R_omy_current
+R_rel_mapped = R_map @ R_omy_rel @ R_map.T
+R_fr3_target = R_fr3_anchor @ R_rel_mapped
+
+현재 position baseline은 base-fixed translation이다.
+
+delta_position_omy = p_omy_current - p_omy_anchor
+p_fr3_target = p_fr3_anchor + POSITION_SCALE * (AXIS_MAP @ delta_position_omy)
+
+### Code-level status
+
+현재 working tree의 실제 FR3_omy_bridge.py는 rising edge에서 OMY pose와 read_site_pose(fr3_data, ...)로 읽은 FR3 current actual pose를 저장한다. 따라서 fr3_target 기반 anchor pair가 현재 코드에 완전히 반영되었다고 기록하지 않는다. 이 source/artifact 차이는 다음 구현에서 해결해야 한다.
+
+## Experiment 4 — Anchor update result
+
+### Plot
+
+![Anchor update result](images/teleop/debugging/03_anchor_update_result.png)
+
+### Configuration / Observed result
+
+공통 parameter와 MAX_DQ = 0.004 rad/cycle을 사용한 plot artifact다. anchor_update_v.csv 기준 position error peak는 약 127.5 mm, orientation error peak는 약 88.2 deg, joint step은 0.004 rad에 붙는다.
+
+### Interpretation / Next decision
+
+파일명은 anchor update이지만 이 결과만으로 개선을 입증할 수 없다. 오히려 큰 spike가 남아 있어 source와 plot을 생성한 revision을 대조하고, Trigger를 움직이지 않고 재입력하는 clutch jump check를 별도로 수행해야 한다.
+
+## Experiment 5 — Clutch jump check
+
+### Plot
+
+![Clutch jump check](images/teleop/debugging/04_clutch_jump_check.png)
+
+### Test protocol / Result
+
+plot 기준으로 Trigger ON, OMY/FR3 약 50 deg 회전, Trigger OFF, pose 유지, Trigger 재ON, 정지 상태 target continuity 확인, 원래 방향 복귀 순서로 해석했다. target은 약 50 deg plateau를 유지하고 재입력 순간 0 deg로 돌아가는 대형 jump는 보이지 않는다. FR3 actual은 상승 구간에서 lag를 보이며, plot 기준 peak position error는 약 35 mm, orientation error는 약 21 deg, maximum joint step은 초반 0.002 rad이다.
+
+### Conclusion
+
+이 session에서는 clutch jump보다 dynamic tracking lag가 지배적으로 보인다. 단, source와 artifact의 revision 일치 여부가 확인되기 전에는 anchor logic의 완전한 해결로 일반화하지 않는다.
+
+## Experiment 6 — MAX_DQ = 0.003
+
+### Plot
+
+![MAX_DQ 0.003](images/teleop/debugging/05_max_dq_0003.png)
+
+### Configuration
+
+POSITION_SCALE = 0.7
+IK_DAMPING = 0.05
+IK_GAIN = 0.05
+ROTATION_IK_WEIGHT = 0.1
+MAX_DQ = 0.003 rad/cycle
+
+### Result / Interpretation
+
+빠른 상승·하강에서 maximum joint step이 장시간 0.003 rad에 포화되고 actual이 target보다 지연된다. plot 기준 peak position error는 약 49 mm, peak orientation error는 약 25–26 deg이며 정지 후 target에 수렴한다. 입력 trajectory와 속도가 동일하지 않으므로 절대 benchmark가 아닌 bandwidth evidence로 취급한다.
+
+## Experiment 7 — MAX_DQ = 0.004
+
+### Plot
+
+![MAX_DQ 0.004](images/teleop/debugging/06_max_dq_0004.png)
+
+### Configuration / Result
+
+공통 parameter와 MAX_DQ = 0.004 rad/cycle을 사용했다. target과 actual의 동적 지연이 줄었고, plot 기준 peak position error는 약 5.6 mm, peak orientation error는 약 9 deg였다. plateau와 정지 구간에서는 거의 일치하며 작은 overshoot 외 발산이나 지속 진동은 보이지 않는다.
+
+### Decision
+
+동일 입력이 보장되지 않는다는 제한이 있지만 0.004 rad/cycle을 simulation baseline 후보로 선택했다.
+
+## Experiment 8 — MAX_DQ = 0.004 reproducibility check
+
+### Plot
+
+![MAX_DQ 0.004 reproducibility check](images/teleop/debugging/07_max_dq_0004_v2.png)
+
+### Configuration
+
+POSITION_SCALE = 0.7
+IK_DAMPING = 0.05
+IK_GAIN = 0.05
+ROTATION_IK_WEIGHT = 0.1
+MAX_DQ = 0.004 rad/cycle
+
+### Result / Conclusion
+
+logs/MAX_DQ_0.004_v2.csv에서 position error peak는 7.78 mm, orientation error peak는 10.02 deg, maximum joint step은 0.004 rad이다. 정지 구간에서는 position error가 대체로 1 mm 이하, orientation error가 sub-degree에 가까워지고 빠른 구간에서 짧은 lag가 남는다. 이 session을 simulation baseline 후보로 채택하지만 동일 trajectory benchmark의 최종 증명으로는 사용하지 않는다.
+
+## Parameter change summary
+
+| Experiment | Anchor logic | MAX_DQ | Main symptom | Result | Decision |
+|---|---|---:|---|---|---|
+| Initial | 검증 전 | 0.002 | target/actual spike | 원인 분리 필요 | logging 확장 |
+| Pre-fix test | 검증 전 | 0.004 | 큰 spike 지속 | 미해결 | target continuity 우선 |
+| Anchor update artifact | 불일치 가능 | 0.004 | 큰 spike 잔존 | 성공 판정 불가 | source/artifact 대조 |
+| Clutch jump check | 별도 session | 0.002 | dynamic lag | jump 작음 | MAX_DQ 비교 |
+| DQ test | 별도 session | 0.003 | lag 및 포화 | 부족 | 0.004 시험 |
+| DQ test | 별도 session | 0.004 | 작은 lag | 개선 | baseline 후보 |
+| Reproduction | 별도 session | 0.004 | 작은 lag | 유사 결과 | baseline 후보 확정 |
+
+## Root cause analysis
+
+### Root cause 1 — Clutch anchor discontinuity
+
+runtime initial pose와 clutch anchor가 혼용되면 leader/follower가 같은 event의 기준을 공유하지 못한다. OMY anchor가 갱신되어도 FR3 target anchor가 갱신되지 않으면 재클러치 target discontinuity가 발생한다. 현재 source에서는 FR3 current actual을 읽는 구조가 확인되므로 fr3_target 기반 anchor pair 적용은 남은 작업이다.
+
+### Root cause 2 — Dynamic command saturation
+
+target이 연속적이어도 빠른 움직임에서는 DLS output이 MAX_DQ에 제한되어 actual이 target보다 지연된다. 정지 후 수렴하는 경우에는 steady-state IK보다 dynamic bandwidth 문제로 분류한다.
+
+### 기각했거나 아직 기각하지 못한 가설
+
+- orientation axis mapping 오류: OMY relative와 FR3 target이 일치하는 session이 있어 단독 root cause로는 기각한다.
+- rotation scaling 오류: target angle이 OMY angle과 비슷한 구간이 있어 단독 root cause로는 기각한다.
+- steady-state IK 정확도 문제: 정지 구간에서 error가 감소하므로 주된 원인으로는 기각한다.
+- clutch anchor 문제: source와 artifact가 불일치해 완전히 기각하지 못했다.
+
+## Current baseline
+
+POSITION_SCALE = 0.7
+IK_DAMPING = 0.05
+IK_GAIN = 0.05
+ROTATION_IK_WEIGHT = 0.1
+MAX_DQ = 0.004
+
+이 값은 MuJoCo simulation baseline이며 실물 FR3 안전 parameter로 직접 사용하면 안 된다.
+
+## Remaining debugging tasks
+
+- fr3_target 기반 clutch anchor pair 구현 및 target jump를 mm/deg로 기록
+- raw dq와 clipped dq 분리 logging 재활성화
+- dq_saturated, dt, saturation ratio 자동 계산
+- MAX_DQ를 max_joint_velocity * dt로 전환
+- 동일 target trajectory replay
+- position-only / orientation-only / combined 6D 분리 실험
+- plot session gap을 NaN으로 분리
+- singularity/joint-limit 인접 조건 검증
+- 실제 FR3 연결 전 velocity/acceleration/safety limit 검토
+
+## Lessons learned
+
+- leader, target, actual을 분리해야 follower tracking 문제를 진단할 수 있다.
+- error spike가 발생하면 gain보다 target continuity를 먼저 검사해야 한다.
+- joint-step saturation은 잘못된 target의 결과일 수도 있다.
+- clutch teleoperation에서는 leader와 follower anchor를 같은 event에서 pair로 캡처해야 한다.
+- parameter 비교에는 동일 input trajectory와 정량 metric이 필요하다.
+- terminal log보다 time-series plot이 transient behavior를 확인하는 데 유리하다.
+
+상위 구현 결과는 [development.md](development.md)의 6D development section을 참고한다.
