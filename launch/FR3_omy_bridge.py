@@ -38,7 +38,6 @@ ENABLE_LOGGING = True
 
 CONTROL_HZ = 1000.0
 CONTROL_DT = 1.0 / CONTROL_HZ
-GRAVITY = np.array([0.0, 0.0, -9.81])
 VIEWER_HZ = 30.0
 LOG_HZ = 100.0
 PRINT_HZ = 1.0
@@ -67,13 +66,13 @@ AXIS_MAP = np.array([
 ROTATION_VECTOR_MAP = AXIS_MAP @ np.diag([1.0, -1.0, -1.0])
 
 # Conservative initial values.
-POSITION_SCALE = 0.30
-ORIENTATION_SCALE = 0.60
+POSITION_SCALE = 0.60
+ORIENTATION_SCALE = 0.30
 
 # Cartesian target rate limits.
 MAX_TARGET_LINEAR_SPEED = 0.10       # m/s
-MAX_TARGET_ANGULAR_SPEED = 2.0       # rad/s
-MAX_TARGET_ANGULAR_ACCEL = 2.0       # rad/s^2
+MAX_TARGET_ANGULAR_SPEED = 2.0      # rad/s
+MAX_TARGET_ANGULAR_ACCEL = 2.0      # rad/s^2
 
 # Task-space feedback used to generate a desired Cartesian twist.
 POSITION_KP = 8.0                    # 1/s
@@ -300,6 +299,7 @@ def compute_joint_target(
     joint_upper,
     target_position,
     target_rotation,
+    command_reference,
     jacp,
     jacr,
     dt,
@@ -361,9 +361,11 @@ def compute_joint_target(
 
     q_current = data.qpos[qpos_indices].copy()
 
-    # Use actual q as the reference instead of accumulating on an old command.
+    # Use the held actuator command as the integration reference. Using the
+    # sagging actual q here would make gravity-induced drift continue when
+    # teleoperation becomes active.
     q_target = np.clip(
-        q_current + qdot_command * dt,
+        command_reference + qdot_command * dt,
         joint_lower,
         joint_upper,
     )
@@ -468,9 +470,6 @@ def main():
     # FR3 model: IK + actuator dynamics.
     fr3_model = mujoco.MjModel.from_xml_path(str(FR3_MODEL_PATH))
     fr3_model.opt.timestep = CONTROL_DT
-    # Make the physical simulation setting explicit. The FR3 XML currently
-    # has the same MuJoCo default, but do not rely on that implicit value.
-    fr3_model.opt.gravity[:] = GRAVITY
     fr3_data = mujoco.MjData(fr3_model)
     mujoco.mj_resetDataKeyframe(
         fr3_model,
@@ -507,6 +506,7 @@ def main():
         fr3_data,
         fr3_ee_site_id,
     )
+    hold_q_target = q_home.copy()
 
     jacp = np.zeros((3, fr3_model.nv))
     jacr = np.zeros((3, fr3_model.nv))
@@ -597,7 +597,6 @@ def main():
                     fr3_anchor_position = fr3_target_position.copy()
                     fr3_anchor_rotation = fr3_target_rotation.copy()
                     teleop_active = True
-                    target_angular_velocity = np.zeros(3)
                     print("Teleoperation ON: new target-based anchor pair")
 
                 elif (
@@ -605,7 +604,6 @@ def main():
                     and trigger_position >= TRIGGER_OFF_THRESHOLD
                 ):
                     teleop_active = False
-                    target_angular_velocity = np.zeros(3)
                     print("Teleoperation OFF: holding last Cartesian target")
 
                 if teleop_active:
@@ -641,20 +639,39 @@ def main():
                 target_angular_speed = 0.0
                 target_angular_velocity = np.zeros(3)
 
-            q_target, diagnostics = compute_joint_target(
-                fr3_model,
-                fr3_data,
-                fr3_ee_site_id,
-                fr3_dof_indices,
-                fr3_qpos_indices,
-                fr3_joint_lower,
-                fr3_joint_upper,
-                fr3_target_position,
-                fr3_target_rotation,
-                jacp,
-                jacr,
-                CONTROL_DT,
-            )
+            if teleop_active:
+                q_target, diagnostics = compute_joint_target(
+                    fr3_model,
+                    fr3_data,
+                    fr3_ee_site_id,
+                    fr3_dof_indices,
+                    fr3_qpos_indices,
+                    fr3_joint_lower,
+                    fr3_joint_upper,
+                    fr3_target_position,
+                    fr3_target_rotation,
+                    hold_q_target,
+                    jacp,
+                    jacr,
+                    CONTROL_DT,
+                )
+                hold_q_target = q_target.copy()
+            else:
+                # Do not recompute the command from sagging q_current while
+                # gravity acts. Hold the last position target until teleop
+                # resumes; this keeps the simulated FR3 at its posture.
+                q_target = hold_q_target.copy()
+                diagnostics = {
+                    "position_error_m": 0.0,
+                    "orientation_error_deg": 0.0,
+                    "raw_max_qdot": 0.0,
+                    "cmd_max_qdot": 0.0,
+                    "qdot_saturated": False,
+                    "jacobian_condition": 0.0,
+                    "max_q_command_error": float(
+                        np.max(np.abs(q_target - fr3_data.qpos[fr3_qpos_indices]))
+                    ),
+                }
 
             fr3_data.ctrl[fr3_actuator_indices] = q_target
             mujoco.mj_step(fr3_model, fr3_data)
