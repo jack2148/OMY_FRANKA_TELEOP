@@ -50,24 +50,49 @@ ROS_TIMEOUT_S = 0.20
 
 OMY_ROS_JOINTS = [f"joint{i}" for i in range(1, 7)]
 OMY_MUJOCO_JOINTS = [f"Joint{i}" for i in range(1, 7)]
+OMY_BASE_BODY_NAME = "base_unit"
+OMY_EE_SITE_NAME = "omy_ee_site"
+FR3_BASE_BODY_NAME = "base"
+FR3_EE_SITE_NAME = "attachment_site"
 TRIGGER_JOINT = "rh_r1_joint"
 
 TRIGGER_ON_THRESHOLD = -0.90
 TRIGGER_OFF_THRESHOLD = -0.70
 
-AXIS_MAP = np.array([
-    [0.0, 1.0, 0.0],
+# Position mapping candidates for manual one-axis calibration.
+POSITION_SAME_AXIS_SIGNS = np.array([1.0, 1.0, 1.0])
+POSITION_AXIS_MAP_CANDIDATES = {
+    "identity": np.eye(3),
+    "current_90": np.array([
+        [0.0, 1.0, 0.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ]),
+    "same_axis": np.diag(POSITION_SAME_AXIS_SIGNS),
+}
+
+# Manual selection only. Keep the current behavior as the initial baseline.
+POSITION_MAP_CANDIDATE = "current_90"
+POSITION_AXIS_MAP = POSITION_AXIS_MAP_CANDIDATES[POSITION_MAP_CANDIDATE].copy()
+
+# Orientation mapping remains independent from position mapping. This is the
+# exact value of the previous ROTATION_VECTOR_MAP.
+ORIENTATION_AXIS_MAP = np.array([
+    [0.0, -1.0, 0.0],
     [-1.0, 0.0, 0.0],
-    [0.0, 0.0, 1.0],
+    [0.0, 0.0, -1.0],
 ])
 
-# Small-angle equivalent of the previous orientation mapping:
-# AXIS_MAP plus [roll, pitch, yaw] signs [1, -1, -1].
-ROTATION_VECTOR_MAP = AXIS_MAP @ np.diag([1.0, -1.0, -1.0])
+TELEOP_MODE = "orientation_only"
+SUPPORTED_TELEOP_MODES = {
+    "position_only",
+    "orientation_only",
+    "full_pose",
+}
 
 # Conservative initial values.
 POSITION_SCALE = 0.60
-ORIENTATION_SCALE = 0.30
+ORIENTATION_SCALE = 1.0
 
 # Cartesian target rate limits.
 MAX_TARGET_LINEAR_SPEED = 0.10       # m/s
@@ -142,10 +167,89 @@ def site_id(model, name):
     return result
 
 
+def body_id(model, name):
+    result = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
+    if result < 0:
+        raise ValueError(f"body not found: {name}")
+    return result
+
+
 def read_site_pose(data, site):
     position = data.site_xpos[site].copy()
     rotation = data.site_xmat[site].reshape(3, 3).copy()
     return position, rotation
+
+
+def transform_from_pose(position, rotation):
+    transform = np.eye(4)
+    transform[:3, :3] = rotation
+    transform[:3, 3] = position
+    return transform
+
+
+def inverse_transform(transform):
+    inverse = np.eye(4)
+    rotation = transform[:3, :3]
+    inverse[:3, :3] = rotation.T
+    inverse[:3, 3] = -rotation.T @ transform[:3, 3]
+    return inverse
+
+
+def read_body_transform(data, body):
+    return transform_from_pose(
+        data.xpos[body],
+        data.xmat[body].reshape(3, 3),
+    )
+
+
+def read_site_transform(data, site):
+    return transform_from_pose(
+        data.site_xpos[site],
+        data.site_xmat[site].reshape(3, 3),
+    )
+
+
+def read_base_ee_transform(data, base_body, ee_site):
+    t_world_base = read_body_transform(data, base_body)
+    t_world_ee = read_site_transform(data, ee_site)
+    return inverse_transform(t_world_base) @ t_world_ee
+
+
+def rotation_diagnostics(rotation):
+    return (
+        float(np.linalg.det(rotation)),
+        float(np.linalg.norm(rotation.T @ rotation - np.eye(3))),
+    )
+
+
+def print_frame_inspection(
+    label,
+    data,
+    base_body_name,
+    base_body,
+    ee_site_name,
+    ee_site,
+):
+    t_world_base = read_body_transform(data, base_body)
+    t_base_ee = read_base_ee_transform(data, base_body, ee_site)
+    base_rotation = t_world_base[:3, :3]
+    ee_rotation = t_base_ee[:3, :3]
+    base_det, base_orth_error = rotation_diagnostics(base_rotation)
+    ee_det, ee_orth_error = rotation_diagnostics(ee_rotation)
+    identity_aligned = np.allclose(base_rotation, np.eye(3), atol=1e-9)
+
+    print(f"{label} frame inspection:")
+    print(f"  base body: {base_body_name}")
+    print(f"  EE site: {ee_site_name}")
+    print(f"  world base position: {t_world_base[:3, 3]}")
+    print(f"  world base rotation:\n{base_rotation}")
+    print(f"  base-relative EE position: {t_base_ee[:3, 3]}")
+    print(f"  base-relative EE rotation:\n{ee_rotation}")
+    print(f"  base rotation det: {base_det:.9f}")
+    print(f"  base rotation orthogonality error: {base_orth_error:.3e}")
+    print(f"  EE rotation det: {ee_det:.9f}")
+    print(f"  EE rotation orthogonality error: {ee_orth_error:.3e}")
+    print(f"  base identity-aligned with world: {identity_aligned}")
 
 
 def skew(vector):
@@ -241,14 +345,14 @@ def make_desired_target(
     delta_position_omy = omy_current_position - omy_anchor_position
     desired_position = (
         fr3_anchor_position
-        + POSITION_SCALE * (AXIS_MAP @ delta_position_omy)
+        + POSITION_SCALE * (POSITION_AXIS_MAP @ delta_position_omy)
     )
 
     omy_relative_rotation = omy_anchor_rotation.T @ omy_current_rotation
     omy_relative_rotvec = matrix_to_rotvec(omy_relative_rotation)
     mapped_rotvec = (
         ORIENTATION_SCALE
-        * (ROTATION_VECTOR_MAP @ omy_relative_rotvec)
+        * (ORIENTATION_AXIS_MAP @ omy_relative_rotvec)
     )
     desired_rotation = fr3_anchor_rotation @ rotvec_to_matrix(mapped_rotvec)
 
@@ -477,6 +581,12 @@ def write_log(log_path, rows):
 # ---------------------------------------------------------------------------
 
 def main():
+    if TELEOP_MODE not in SUPPORTED_TELEOP_MODES:
+        raise ValueError(
+            f"unsupported TELEOP_MODE: {TELEOP_MODE!r}; "
+            f"choose one of {sorted(SUPPORTED_TELEOP_MODES)}"
+        )
+
     rclpy.init()
 
     # OMY model: FK only.
@@ -488,7 +598,8 @@ def main():
         keyframe_id(omy_model, "home"),
     )
     mujoco.mj_forward(omy_model, omy_data)
-    omy_ee_site_id = site_id(omy_model, "omy_ee_site")
+    omy_base_body_id = body_id(omy_model, OMY_BASE_BODY_NAME)
+    omy_ee_site_id = site_id(omy_model, OMY_EE_SITE_NAME)
 
     # FR3 model: IK + actuator dynamics.
     fr3_model = mujoco.MjModel.from_xml_path(str(FR3_MODEL_PATH))
@@ -500,7 +611,25 @@ def main():
         keyframe_id(fr3_model, "home"),
     )
     mujoco.mj_forward(fr3_model, fr3_data)
-    fr3_ee_site_id = site_id(fr3_model, "attachment_site")
+    fr3_base_body_id = body_id(fr3_model, FR3_BASE_BODY_NAME)
+    fr3_ee_site_id = site_id(fr3_model, FR3_EE_SITE_NAME)
+
+    print_frame_inspection(
+        "OMY",
+        omy_data,
+        OMY_BASE_BODY_NAME,
+        omy_base_body_id,
+        OMY_EE_SITE_NAME,
+        omy_ee_site_id,
+    )
+    print_frame_inspection(
+        "FR3",
+        fr3_data,
+        FR3_BASE_BODY_NAME,
+        fr3_base_body_id,
+        FR3_EE_SITE_NAME,
+        fr3_ee_site_id,
+    )
 
     fr3_joint_ids = np.array(
         [fr3_model.joint(f"fr3_joint{i}").id for i in range(1, 8)],
@@ -557,6 +686,7 @@ def main():
     target_angular_velocity = np.zeros(3)
     omy_anchor_position = None
     omy_anchor_rotation = None
+    omy_anchor_base_ee_transform = None
     fr3_anchor_position = fr3_command_position.copy()
     fr3_anchor_rotation = fr3_command_rotation.copy()
 
@@ -587,6 +717,8 @@ def main():
 
         print(f"Configured control rate: {CONTROL_HZ:.0f} Hz")
         print(f"MuJoCo timestep: {fr3_model.opt.timestep:.6f} s")
+        print(f"Position axis map candidate: {POSITION_MAP_CANDIDATE}")
+        print(f"Teleoperation mode: {TELEOP_MODE}")
         print("Waiting for /leader/joint_states...")
 
         step_index = 0
@@ -605,6 +737,17 @@ def main():
                 and cycle_start - last_message_time <= ROS_TIMEOUT_S
             )
 
+            omy_base_ee_position = np.zeros(3)
+            omy_base_ee_rotation_vector = np.zeros(3)
+            omy_clutch_base_position_delta = np.zeros(3)
+            omy_clutch_spatial_rotation_vector = np.zeros(3)
+            omy_raw_clutch_position_delta = np.zeros(3)
+            omy_delta_rotvec = np.zeros(3)
+            fr3_command_position_delta = np.zeros(3)
+            fr3_mapped_rotation_delta = np.zeros(3)
+            fr3_target_position_delta = np.zeros(3)
+            fr3_actual_position_delta = np.zeros(3)
+
             if ros_fresh:
                 for address, position in zip(omy_qpos_addresses, omy_target):
                     omy_data.qpos[address] = position
@@ -614,6 +757,15 @@ def main():
                     omy_data,
                     omy_ee_site_id,
                 )
+                omy_base_ee_transform = read_base_ee_transform(
+                    omy_data,
+                    omy_base_body_id,
+                    omy_ee_site_id,
+                )
+                omy_base_ee_position = omy_base_ee_transform[:3, 3].copy()
+                omy_base_ee_rotation_vector = matrix_to_rotvec(
+                    omy_base_ee_transform[:3, :3]
+                )
 
                 if (
                     not teleop_active
@@ -622,6 +774,7 @@ def main():
                     clutch_id += 1
                     omy_anchor_position = omy_current_position.copy()
                     omy_anchor_rotation = omy_current_rotation.copy()
+                    omy_anchor_base_ee_transform = omy_base_ee_transform.copy()
                     fr3_anchor_position = fr3_command_position.copy()
                     fr3_anchor_rotation = fr3_command_rotation.copy()
                     teleop_active = True
@@ -649,8 +802,27 @@ def main():
                         f"held command angle={held_command_angle_deg:.2f} deg"
                     )
 
+                if teleop_active and omy_anchor_base_ee_transform is not None:
+                    omy_raw_clutch_position_delta = (
+                        omy_current_position - omy_anchor_position
+                    )
+                    omy_delta_rotvec = matrix_to_rotvec(
+                        omy_anchor_rotation.T @ omy_current_rotation
+                    )
+                    omy_clutch_base_position_delta = (
+                        omy_base_ee_transform[:3, 3]
+                        - omy_anchor_base_ee_transform[:3, 3]
+                    )
+                    omy_clutch_spatial_rotation_vector = matrix_to_rotvec(
+                        omy_base_ee_transform[:3, :3]
+                        @ omy_anchor_base_ee_transform[:3, :3].T
+                    )
+
                 if teleop_active:
-                    fr3_command_position, fr3_command_rotation = make_desired_target(
+                    (
+                        desired_command_position,
+                        desired_command_rotation,
+                    ) = make_desired_target(
                         omy_anchor_position,
                         omy_anchor_rotation,
                         omy_current_position,
@@ -658,6 +830,15 @@ def main():
                         fr3_anchor_position,
                         fr3_anchor_rotation,
                     )
+                    if TELEOP_MODE == "position_only":
+                        fr3_command_position = desired_command_position
+                        fr3_command_rotation = fr3_anchor_rotation.copy()
+                    elif TELEOP_MODE == "orientation_only":
+                        fr3_command_position = fr3_anchor_position.copy()
+                        fr3_command_rotation = desired_command_rotation
+                    else:
+                        fr3_command_position = desired_command_position
+                        fr3_command_rotation = desired_command_rotation
 
                 (
                     fr3_target_position,
@@ -696,17 +877,14 @@ def main():
                 fr3_command_position = fr3_target_position.copy()
                 fr3_command_rotation = fr3_target_rotation.copy()
 
-            if omy_anchor_rotation is None or not ros_fresh:
+            if omy_anchor_rotation is None or not ros_fresh or not teleop_active:
                 omy_relative_rotation_deg = 0.0
             else:
-                omy_relative_rotation_deg = float(
-                    np.rad2deg(
-                        np.linalg.norm(
-                            matrix_to_rotvec(
-                                omy_anchor_rotation.T @ omy_current_rotation
-                            )
-                        )
-                    )
+                omy_relative_rotation_deg = float(np.rad2deg(
+                    np.linalg.norm(omy_delta_rotvec)
+                ))
+                fr3_mapped_rotation_delta = matrix_to_rotvec(
+                    fr3_anchor_rotation.T @ fr3_command_rotation
                 )
             fr3_command_cumulative_rotation_deg = rotation_distance_deg(
                 fr3_initial_command_rotation,
@@ -757,6 +935,30 @@ def main():
 
             fr3_data.ctrl[fr3_actuator_indices] = q_target
             mujoco.mj_step(fr3_model, fr3_data)
+            fr3_actual_position, fr3_actual_rotation = read_site_pose(
+                fr3_data,
+                fr3_ee_site_id,
+            )
+            fr3_command_session_rotvec = matrix_to_rotvec(
+                fr3_command_rotation @ fr3_initial_command_rotation.T
+            )
+            fr3_target_session_rotvec = matrix_to_rotvec(
+                fr3_target_rotation @ fr3_initial_command_rotation.T
+            )
+            fr3_actual_session_rotvec = matrix_to_rotvec(
+                fr3_actual_rotation @ fr3_initial_command_rotation.T
+            )
+
+            if omy_anchor_position is not None:
+                fr3_command_position_delta = (
+                    fr3_command_position - fr3_anchor_position
+                )
+                fr3_target_position_delta = (
+                    fr3_target_position - fr3_anchor_position
+                )
+                fr3_actual_position_delta = (
+                    fr3_actual_position - fr3_anchor_position
+                )
 
             now = time.perf_counter()
             step_index += 1
@@ -785,6 +987,78 @@ def main():
                     "teleop_active": int(teleop_active),
                     "ros_fresh": int(ros_fresh),
                     "clutch_id": clutch_id,
+                    "omy_raw_clutch_position_dx": (
+                        omy_raw_clutch_position_delta[0]
+                    ),
+                    "omy_raw_clutch_position_dy": (
+                        omy_raw_clutch_position_delta[1]
+                    ),
+                    "omy_raw_clutch_position_dz": (
+                        omy_raw_clutch_position_delta[2]
+                    ),
+                    "omy_delta_position_x_m": omy_raw_clutch_position_delta[0],
+                    "omy_delta_position_y_m": omy_raw_clutch_position_delta[1],
+                    "omy_delta_position_z_m": omy_raw_clutch_position_delta[2],
+                    "omy_delta_rotvec_x_rad": omy_delta_rotvec[0],
+                    "omy_delta_rotvec_y_rad": omy_delta_rotvec[1],
+                    "omy_delta_rotvec_z_rad": omy_delta_rotvec[2],
+                    "fr3_command_position_dx": fr3_command_position_delta[0],
+                    "fr3_command_position_dy": fr3_command_position_delta[1],
+                    "fr3_command_position_dz": fr3_command_position_delta[2],
+                    "fr3_target_position_dx": fr3_target_position_delta[0],
+                    "fr3_target_position_dy": fr3_target_position_delta[1],
+                    "fr3_target_position_dz": fr3_target_position_delta[2],
+                    "fr3_actual_position_dx": fr3_actual_position_delta[0],
+                    "fr3_actual_position_dy": fr3_actual_position_delta[1],
+                    "fr3_actual_position_dz": fr3_actual_position_delta[2],
+                    "mapped_position_delta_x_m": fr3_command_position_delta[0],
+                    "mapped_position_delta_y_m": fr3_command_position_delta[1],
+                    "mapped_position_delta_z_m": fr3_command_position_delta[2],
+                    "mapped_rotation_delta_x_rad": fr3_mapped_rotation_delta[0],
+                    "mapped_rotation_delta_y_rad": fr3_mapped_rotation_delta[1],
+                    "mapped_rotation_delta_z_rad": fr3_mapped_rotation_delta[2],
+                    "fr3_command_position_x": fr3_command_position[0],
+                    "fr3_command_position_y": fr3_command_position[1],
+                    "fr3_command_position_z": fr3_command_position[2],
+                    "fr3_target_position_x": fr3_target_position[0],
+                    "fr3_target_position_y": fr3_target_position[1],
+                    "fr3_target_position_z": fr3_target_position[2],
+                    "fr3_actual_position_x": fr3_actual_position[0],
+                    "fr3_actual_position_y": fr3_actual_position[1],
+                    "fr3_actual_position_z": fr3_actual_position[2],
+                    "fr3_command_rotvec_x": fr3_command_session_rotvec[0],
+                    "fr3_command_rotvec_y": fr3_command_session_rotvec[1],
+                    "fr3_command_rotvec_z": fr3_command_session_rotvec[2],
+                    "fr3_target_rotvec_x": fr3_target_session_rotvec[0],
+                    "fr3_target_rotvec_y": fr3_target_session_rotvec[1],
+                    "fr3_target_rotvec_z": fr3_target_session_rotvec[2],
+                    "fr3_actual_rotvec_x": fr3_actual_session_rotvec[0],
+                    "fr3_actual_rotvec_y": fr3_actual_session_rotvec[1],
+                    "fr3_actual_rotvec_z": fr3_actual_session_rotvec[2],
+                    "omy_base_ee_position_x": omy_base_ee_position[0],
+                    "omy_base_ee_position_y": omy_base_ee_position[1],
+                    "omy_base_ee_position_z": omy_base_ee_position[2],
+                    "omy_base_ee_rotvec_x": omy_base_ee_rotation_vector[0],
+                    "omy_base_ee_rotvec_y": omy_base_ee_rotation_vector[1],
+                    "omy_base_ee_rotvec_z": omy_base_ee_rotation_vector[2],
+                    "omy_clutch_base_delta_x": (
+                        omy_clutch_base_position_delta[0]
+                    ),
+                    "omy_clutch_base_delta_y": (
+                        omy_clutch_base_position_delta[1]
+                    ),
+                    "omy_clutch_base_delta_z": (
+                        omy_clutch_base_position_delta[2]
+                    ),
+                    "omy_clutch_spatial_rotvec_x": (
+                        omy_clutch_spatial_rotation_vector[0]
+                    ),
+                    "omy_clutch_spatial_rotvec_y": (
+                        omy_clutch_spatial_rotation_vector[1]
+                    ),
+                    "omy_clutch_spatial_rotvec_z": (
+                        omy_clutch_spatial_rotation_vector[2]
+                    ),
                     "omy_relative_rotation_deg": omy_relative_rotation_deg,
                     "fr3_command_cumulative_rotation_deg": (
                         fr3_command_cumulative_rotation_deg
@@ -810,6 +1084,13 @@ def main():
                 })
 
             if now - last_print >= 1.0 / PRINT_HZ:
+                print(
+                    f"mode={TELEOP_MODE} | "
+                    f"OMY dp={omy_raw_clutch_position_delta} | "
+                    f"mapped dp={fr3_command_position_delta} | "
+                    f"OMY dr={omy_delta_rotvec} | "
+                    f"mapped dr={fr3_mapped_rotation_delta}"
+                )
                 print(
                     f"pos={1000.0 * diagnostics['position_error_m']:.2f} mm | "
                     f"rot={diagnostics['orientation_error_deg']:.2f} deg | "

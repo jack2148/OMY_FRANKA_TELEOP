@@ -83,6 +83,109 @@ rotation = data.site_xmat[site_id].reshape(3, 3).copy()
 
 현재 IK objective에는 `position`만 사용한다. `rotation`은 pose 확인을 위해 조회할 수 있지만 현재 DLS 오차항에는 포함하지 않는다.
 
+## Base-frame pose inspection
+
+Base-frame retargeting을 구현하기 전, 현재 MuJoCo 모델의 base와 EE frame을
+다음과 같이 확인한다.
+
+| Robot | Base body | EE site | Base frame alignment |
+|---|---|---|---|
+| OMY-L100 | `base_unit` | `omy_ee_site` | model world frame과 identity-aligned |
+| FR3 | `base` | `attachment_site` | model world frame과 identity-aligned |
+
+각 모델에서 다음 변환을 사용한다.
+
+```text
+T_world_base = pose(base body)
+T_world_ee   = pose(EE site)
+T_base_ee    = inverse(T_world_base) @ T_world_ee
+```
+
+현재 home keyframe에서 두 base body의 world position은 `[0, 0, 0]`이고,
+world rotation은 identity matrix이다. 따라서 현재 모델에서는 base-relative
+EE pose를 계산할 때 추가적인 base-frame 회전 보정이 필요하지 않다. 단, 이것은
+현재 MuJoCo 모델의 정렬 상태에 대한 진단이며, 실제 로봇 설치 frame과의 일치를
+의미하지 않는다.
+
+`launch/FR3_omy_bridge.py`는 시작 시 두 로봇에 대해 base body/site 이름,
+world base pose, base-relative EE pose, rotation determinant와
+orthonormality error를 출력한다. Runtime CSV에는 OMY base-relative EE
+position/rotation vector와 Trigger anchor 기준의 base-frame position delta,
+spatial rotation vector를 기록한다.
+
+### Base-frame inspection test protocol
+
+Teleoperation target mapping을 바꾸지 않은 상태에서 OMY를 한 축씩 천천히
+움직이고 CSV의 `omy_clutch_base_delta_*`와
+`omy_clutch_spatial_rotvec_*`를 확인한다.
+
+1. OMY base X, Y, Z 방향으로 각각 평행 이동한다. 대응하는
+   `omy_clutch_base_delta_x/y/z` 성분이 주로 증가하고, 부호가 실제 이동
+   방향과 일치하는지 확인한다.
+2. OMY base를 X, Y, Z 축으로 각각 회전한다. 대응하는
+   `omy_clutch_spatial_rotvec_x/y/z` 성분이 주로 증가하고, 회전 부호가
+   오른손 법칙과 일치하는지 확인한다.
+3. 각 실험 사이에는 Trigger OFF 후 OMY를 기준 자세로 되돌리고, 다음
+   Trigger ON으로 새 clutch anchor를 만든다.
+4. 한 번에 여러 축을 움직이지 않고, 작은 동작부터 시작해 cross-axis
+   성분과 noise를 함께 기록한다.
+
+이 단계에서는 위 진단값을 target 생성에 사용하지 않는다. 실제
+base-frame retargeting은 이 축과 부호 검증이 끝난 다음 별도 변경으로
+적용한다.
+
+## Axis mapping calibration
+
+Position과 orientation mapping은 `POSITION_AXIS_MAP`과
+`ORIENTATION_AXIS_MAP`으로 분리되어 있다. 초기 active position mapping은
+기존 동작을 보존하기 위해 `current_90`으로 유지한다. 수동 A/B 테스트용
+position 후보는 다음과 같다.
+
+| Candidate | Mapping |
+|---|---|
+| `identity` | OMY X/Y/Z → FR3 X/Y/Z |
+| `current_90` | 기존 `[[0,1,0],[-1,0,0],[0,0,1]]` |
+| `same_axis` | 동일 축, `POSITION_SAME_AXIS_SIGNS`로 부호 설정 |
+
+`POSITION_MAP_CANDIDATE`를 직접 변경해 후보를 선택하며 자동 선택은 하지
+않는다. `TRANSLATION_CALIBRATION_MODE = True`로 켜면 orientation command는
+clutch anchor에 고정되고 translation command만 갱신된다. 이 모드는 기본적으로
+꺼져 있다.
+
+### Translation axis test protocol
+
+각 테스트 전 Trigger OFF 후 leader를 기준 자세로 되돌리고, Trigger ON으로
+새 clutch anchor를 만든다. 한 번에 한 방향만 천천히 움직인다.
+
+현재 기본 후보 `current_90`의 signed 변환은 다음과 같다.
+
+```text
+[fr3_dx, fr3_dy, fr3_dz]
+= POSITION_SCALE * [omy_dy, -omy_dx, omy_dz]
+```
+
+따라서 raw OMY delta가 `[+a, 0, 0]`이면 mapped FR3 delta는
+`[0, -POSITION_SCALE*a, 0]`, `[0, +a, 0]`이면
+`[POSITION_SCALE*a, 0, 0]`, `[0, 0, +a]`이면
+`[0, 0, POSITION_SCALE*a]`가 예상된다. 실제 물리적 오른쪽·앞·위
+동작에서 raw delta의 주축과 부호를 먼저 측정하고, 이 식으로 mapped signed
+delta를 대조한다.
+
+1. 물리적 leader를 오른쪽으로 이동한다. CSV의
+   `omy_raw_clutch_position_dx/dy/dz`에서 실제로 증가하는 raw 축과 부호를
+   기록하고, `fr3_command_position_dx/dy/dz`가 의도한 FR3 오른쪽 방향으로
+   매핑되는지 확인한다.
+2. 물리적 leader를 앞으로 이동한다. raw delta의 주축과 부호를 기록하고,
+   FR3 command delta가 앞으로 이동하는지 확인한다.
+3. 물리적 leader를 위로 이동한다. raw Z 성분과 mapped FR3 Z 성분의 부호를
+   확인한다.
+4. `fr3_target_position_d*`와 `fr3_actual_position_d*`를 함께 비교해
+   rate-limited target과 실제 EE가 같은 방향으로 움직이는지 확인한다.
+
+후보 mapping은 자동으로 바꾸지 않는다. 오른쪽·앞·위의 세 실험에서 raw
+축과 mapped 축의 signed 결과를 기록한 뒤, 가장 일관된 후보를 수동으로
+선택한다.
+
 ## 3. 실제 OMY joint state 기반 실시간 FK
 
 ```text
@@ -542,3 +645,100 @@ fr3_anchor_rotation = fr3_target_rotation.copy()
 ## 10. 결론
 
 현재 MuJoCo 검증 단계에서는 OMY-L100 → FR3 position + orientation 6D Cartesian teleoperation의 기본 pipeline과 rotational DLS IK가 동작한다. `MAX_DQ = 0.004` baseline에서 기록된 한 로그는 position error 약 `7.78 mm`, orientation error 약 `10.02 deg`를 보였다. 다만 재클러치 anchor continuity와 빠른 동작 안정성은 추가 검증이 필요하므로, 실로봇 적용 준비가 완료되었다고 판단하지 않는다.
+
+## 2026-07-28 — Velocity IK and axis-separated teleoperation validation
+
+### 1. IK command changed to velocity-based control
+
+기존 joint command는 control cycle마다 정의된 increment를 누적했다.
+
+```python
+q_command_next = q_command_previous + dq
+```
+
+따라서 `dq`가 cycle 단위이면 실제 motion speed가 loop frequency에 의존한다.
+현재 controller는 joint velocity `qdot`을 `rad/s`로 계산하고, timestep을
+사용해 per-step increment를 만든다.
+
+```python
+qdot_command = np.clip(
+    qdot_raw,
+    -MAX_JOINT_SPEED,
+    MAX_JOINT_SPEED,
+)
+q_target = np.clip(
+    command_reference + qdot_command * dt,
+    joint_lower,
+    joint_upper,
+)
+```
+
+`MAX_JOINT_SPEED`로 joint velocity를 제한하며, target 1 kHz controller의
+command 해석과 measured `dt` 변화에 대한 일관성을 목표로 한다. 이 기록은
+simulation loop가 hard real-time 1 kHz를 달성했다고 주장하지 않는다.
+
+### 2. Position and orientation validation separated by mode
+
+Teleoperation은 다음 세 mode로 분리되었다.
+
+- `position_only`: position command를 갱신하고 orientation command는 hold
+- `orientation_only`: orientation command를 갱신하고 position command는 hold
+- `full_pose`: position과 orientation command를 모두 갱신
+
+Position과 orientation의 signed XYZ diagnostics도 별도로 추가했다.
+
+Position diagnostics:
+
+- OMY clutch-relative position x/y/z
+- mapped FR3 position increment x/y/z
+- FR3 command position x/y/z
+- FR3 target position x/y/z
+
+Orientation diagnostics:
+
+- OMY clutch-relative rotvec x/y/z
+- mapped FR3 rotation increment x/y/z
+- FR3 command rotvec x/y/z
+- FR3 target rotvec x/y/z
+
+검증 결과 position-only motion은 의도한 operator direction과 일치했다.
+Orientation-only input은 robot-frame 순서인 upward, downward, right, left로
+테스트했으며, 반대 방향 입력은 반대 mapped axis와 sign을 생성했다. FR3
+command와 target은 mapped value를 따라갔다.
+
+### 3. Scale changes
+
+정상 controller baseline의 `ORIENTATION_SCALE`은 `0.3`이다. Signed
+orientation-axis validation에서는 mapped rotation response를 시각적으로
+명확하게 보기 위해 `ORIENTATION_SCALE = 1.0`을 임시로 사용했다. 이 값은
+최종 teleoperation scale로 선택하지 않았으며, controller baseline은
+`ORIENTATION_SCALE = 0.3`으로 유지한다.
+
+`POSITION_SCALE`은 현재 `0.60`이며 오늘 diff에서 변경된 값으로 확인되지 않아
+이전 값은 기록하지 않는다.
+
+### 4. Current status
+
+- [x] velocity-based IK applied
+- [x] position and orientation test modes applied
+- [x] signed XYZ position diagnostics completed
+- [x] signed XYZ orientation diagnostics completed
+- [x] current position mapping accepted
+- [x] current orientation mapping accepted
+
+Joint posture behavior will be handled in a separate follow-up task.
+
+### Validation plots
+
+![Velocity-based DLS IK and conditioned target tracking result](images/teleop/development/20260728/velocity_ik_summary.png)
+
+Velocity-based DLS IK and conditioned target tracking result.
+
+![Position-only signed-axis validation](images/teleop/development/20260728/signed_position_axes.png)
+
+Position-only signed-axis validation.
+
+![Orientation-only signed-axis validation in robot-frame order](images/teleop/development/20260728/signed_orientation_axes.png)
+
+Orientation-only signed-axis validation in robot-frame order: upward, downward,
+right, left. Visualization run with `ORIENTATION_SCALE = 1.0`.

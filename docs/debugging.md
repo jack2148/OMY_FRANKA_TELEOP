@@ -615,3 +615,135 @@ MAX_DQ = 0.004
 - terminal log보다 time-series plot이 transient behavior를 확인하는 데 유리하다.
 
 상위 구현 결과는 [development.md](development.md)의 6D development section을 참고한다.
+
+## 2026-07-28 — Velocity IK, axis isolation, and scale tuning
+
+### Issue 1. Per-cycle IK command depended on control frequency
+
+#### Symptom
+
+- FR3 target tracking changed depending on the actual loop frequency.
+- A fixed `MAX_DQ` represented `rad/cycle` rather than `rad/s`.
+- When the loop frequency decreased, the available physical joint speed also decreased.
+
+#### Previous implementation
+
+```python
+q_command_next = q_command_previous + dq
+```
+
+#### Modification
+
+```python
+qdot = velocity_dls_ik(...)
+qdot = clip(qdot, joint_speed_limit)
+dq = qdot * dt
+```
+
+#### Result
+
+- `qdot` is logged in `rad/s`.
+- Raw `qdot` and commanded `qdot` can be compared.
+- Final validation runs did not show persistent joint-speed saturation.
+- Tracking behavior became easier to interpret independently of cycle count.
+
+이 변경만으로 모든 tracking issue가 해결되었다고 주장하지 않는다.
+
+### Issue 2. Position and orientation effects could not be distinguished
+
+#### Symptom
+
+- Full-pose operation mixed translation and rotation.
+- Norm-only plots did not reveal which XYZ axis or sign was active.
+- OMY wrist rotation could also produce EE translation, making the red target motion difficult to interpret.
+
+#### Modification
+
+Teleoperation mode를 다음과 같이 분리했다.
+
+- `position_only`: position command를 갱신하고 orientation command는 hold
+- `orientation_only`: orientation command를 갱신하고 position command는 hold
+- `full_pose`: position과 orientation command를 모두 갱신
+
+`POSITION_AXIS_MAP`과 `ORIENTATION_AXIS_MAP`은 독립적으로 유지했다.
+Signed CSV diagnostics도 position과 orientation에 대해 별도로 기록했다.
+
+Position diagnostics:
+
+- OMY clutch-relative position x/y/z
+- mapped FR3 position increment x/y/z
+- FR3 command position x/y/z
+- FR3 target position x/y/z
+
+Orientation diagnostics:
+
+- OMY clutch-relative rotvec x/y/z
+- mapped FR3 rotation increment x/y/z
+- FR3 command rotvec x/y/z
+- FR3 target rotvec x/y/z
+
+Teleop-inactive intervals는 plot에서 mask/shade 처리했다.
+
+#### Position test result
+
+Position-only operation은 의도한 방향으로 움직였고, 현재 position mapping을
+사용하기로 했다. Position-only operation 동안 orientation은 hold되었다.
+
+![Position-only signed-axis debugging result](images/teleop/development/20260728/signed_position_axes.png)
+
+Position-only signed-axis debugging result.
+
+#### Orientation test result
+
+Orientation-only test는 다음 순서로 수행했다.
+
+1. upward
+2. downward
+3. right
+4. left
+
+Upward/downward 입력은 서로 반대인 mapped sign을 만들었고, right/left 입력도
+서로 반대인 mapped sign을 만들었다. FR3 command와 target은 mapped rotation
+component를 따라갔으며, orientation-only operation 동안 position은 hold되었다.
+
+![Orientation-only signed-axis debugging result](images/teleop/development/20260728/signed_orientation_axes.png)
+
+Orientation-only signed-axis debugging result. Visualization run with
+`ORIENTATION_SCALE = 1.0`.
+
+### Issue 3. Position and orientation scale tuning
+
+오늘 source와 git diff에서 확인된 scale 관련 설정은 다음과 같다.
+
+| Parameter | Baseline | Temporary test value | Final value | Purpose |
+|---|---:|---:|---:|---|
+| `ORIENTATION_SCALE` | `0.3` | `1.0` | `0.3` | Signed orientation-axis response를 눈으로 명확히 확인하기 위한 일시적 확대 |
+
+`POSITION_SCALE`은 현재 `0.60`이며 오늘 diff에서 변경된 값으로 확인되지 않아
+이전 값은 검증하지 않았다.
+
+관련 conditioning parameter의 현재 source 값은 다음과 같다. 이 값들은 scale
+변경으로 분류하지 않았다.
+
+- `MAX_TARGET_ANGULAR_SPEED = 2.0`
+- `MAX_TARGET_ANGULAR_ACCEL = 2.0`
+- `TARGET_ROTATION_KP = 4.0`
+
+정상 controller baseline의 `ORIENTATION_SCALE`은 `0.3`이며, `1.0`은 최종
+teleoperation scale이 아니다. The signed orientation-axis plot must be
+interpreted as an axis/sign validation result, not as a performance result for
+the final scale.
+
+### Final debugging status
+
+- velocity IK conversion: completed
+- position-axis test: completed
+- orientation-axis test: completed
+- scale settings: recorded from current source
+- remaining joint-posture issue: deferred to the next work session
+
+### Validation plots
+
+![Velocity-based DLS IK and conditioned target tracking result](images/teleop/development/20260728/velocity_ik_summary.png)
+
+Velocity-based DLS IK and conditioned target tracking result.
