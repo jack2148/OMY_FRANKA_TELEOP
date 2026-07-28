@@ -1,7 +1,7 @@
 # FR3–OMY Cartesian Teleoperation 디버깅 기록
 
 최초 작성: 2026-07-24
-최종 수정: 2026-07-27
+최종 수정: 2026-07-28
 
 개발 문서: [FR3–OMY Cartesian Teleoperation 개발 기록](development.md)
 
@@ -398,7 +398,7 @@ IK_DAMPING = 0.05
 IK_GAIN = 0.05
 ROTATION_IK_WEIGHT = 0.1
 
-MAX_DQ는 실험마다 달랐다. 공통 debug 항목은 OMY current/delta position, OMY relative rotation vector/angle, FR3 target/current position, position error, FR3 rotation error vector/angle, OMY/FR3 target/FR3 actual orientation, q_current, q_command, maximum joint step이다. 현재 working tree에서는 ENABLE_CSV_LOGGING = False로 새 CSV 기록이 비활성화되어 있다.
+MAX_DQ는 실험마다 달랐다. 공통 debug 항목은 OMY current/delta position, OMY relative rotation vector/angle, FR3 target/current position, position error, FR3 rotation error vector/angle, OMY/FR3 target/FR3 actual orientation, q_current, q_command, maximum joint step이다. 최신 working tree에서는 ENABLE_CSV_LOGGING = True이며 실행별 target_anchor_TIMESTAMP.csv를 생성한다.
 
 ## 3. Diagnostic principle
 
@@ -474,7 +474,7 @@ p_fr3_target = p_fr3_anchor + POSITION_SCALE * (AXIS_MAP @ delta_position_omy)
 
 ### Code-level status
 
-현재 working tree의 실제 FR3_omy_bridge.py는 rising edge에서 OMY pose와 read_site_pose(fr3_data, ...)로 읽은 FR3 current actual pose를 저장한다. 따라서 fr3_target 기반 anchor pair가 현재 코드에 완전히 반영되었다고 기록하지 않는다. 이 source/artifact 차이는 다음 구현에서 해결해야 한다.
+이후 코드 수정에서 rising edge는 OMY current pose와 FR3 current target pose를 anchor pair로 저장하도록 변경되었다. 현재 source는 fr3_target 기반 anchor를 사용하고, rising edge에서 target position/rotation jump를 직접 출력한다. 과거 plot artifact와 현재 source가 생성 시점에 따라 다를 수 있으므로, 새 실행의 target_anchor_TIMESTAMP.csv로 continuity를 재검증한다.
 
 ## Experiment 4 — Anchor update result
 
@@ -488,7 +488,7 @@ p_fr3_target = p_fr3_anchor + POSITION_SCALE * (AXIS_MAP @ delta_position_omy)
 
 ### Interpretation / Next decision
 
-파일명은 anchor update이지만 이 결과만으로 개선을 입증할 수 없다. 오히려 큰 spike가 남아 있어 source와 plot을 생성한 revision을 대조하고, Trigger를 움직이지 않고 재입력하는 clutch jump check를 별도로 수행해야 한다.
+파일명은 anchor update이지만 이 과거 결과만으로 현재 target-based fix의 성능을 입증할 수 없다. 큰 spike가 남아 있어 새 source로 target_anchor_TIMESTAMP.csv를 생성하고, Trigger를 움직이지 않고 재입력하는 clutch jump check를 다시 수행해야 한다.
 
 ## Experiment 5 — Clutch jump check
 
@@ -570,7 +570,7 @@ logs/MAX_DQ_0.004_v2.csv에서 position error peak는 7.78 mm, orientation error
 
 ### Root cause 1 — Clutch anchor discontinuity
 
-runtime initial pose와 clutch anchor가 혼용되면 leader/follower가 같은 event의 기준을 공유하지 못한다. OMY anchor가 갱신되어도 FR3 target anchor가 갱신되지 않으면 재클러치 target discontinuity가 발생한다. 현재 source에서는 FR3 current actual을 읽는 구조가 확인되므로 fr3_target 기반 anchor pair 적용은 남은 작업이다.
+runtime initial pose와 clutch anchor가 혼용되면 leader/follower가 같은 event의 기준을 공유하지 못한다. OMY anchor가 갱신되어도 FR3 target anchor가 갱신되지 않으면 재클러치 target discontinuity가 발생한다. 현재 source는 FR3 current actual이 아니라 유지 중인 FR3 target을 clutch anchor로 사용한다. 과거 artifact와 새 실행 결과를 분리해 해석해야 한다.
 
 ### Root cause 2 — Dynamic command saturation
 
@@ -595,7 +595,7 @@ MAX_DQ = 0.004
 
 ## Remaining debugging tasks
 
-- fr3_target 기반 clutch anchor pair 구현 및 target jump를 mm/deg로 기록
+- target-based clutch anchor pair의 target jump를 mm/deg로 재검증
 - raw dq와 clipped dq 분리 logging 재활성화
 - dq_saturated, dt, saturation ratio 자동 계산
 - MAX_DQ를 max_joint_velocity * dt로 전환

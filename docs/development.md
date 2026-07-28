@@ -1,9 +1,9 @@
 # FR3–OMY Cartesian Teleoperation Development Log
 
 최초 작성: 2026-07-23<br>
-최종 수정: 2026-07-27
+최종 수정: 2026-07-28
 
-> Current status: 6D position-orientation teleoperation is operational in MuJoCo, while target-based clutch re-anchoring and standardized quantitative evaluation remain incomplete.
+> Current status: 6D position-orientation teleoperation and target-based clutch re-anchoring are operational in MuJoCo, while standardized quantitative evaluation remains incomplete.
 
 ## Phase 1 — Position-only Cartesian Teleoperation
 
@@ -351,7 +351,7 @@ max_joint_step = np.max(np.abs(dq))
 
 ## Phase 2 — 6D Cartesian Teleoperation
 
-Status: In progress on 2026-07-27
+Status: In progress on 2026-07-28
 
 ## 1. 작업 목표
 
@@ -409,7 +409,7 @@ AXIS_MAP = np.array([
 Euler angle을 단순히 빼지 않고 rotation matrix의 상대변환을 계산한 뒤 rotation vector와 angle로 검증한다.
 
 ```python
-R_omy_rel = R_omy_initial.T @ R_omy_current
+R_omy_rel = R_omy_anchor.T @ R_omy_current
 ```
 
 orientation mapping 후보는 position mapping과 분리된 변수로 유지한다.
@@ -421,7 +421,7 @@ R_rel_mapped = (
     @ R_omy_delta_rotation_for_target
     @ R_FR3_FROM_OMY_ORIENTATION.T
 )
-R_fr3_target = R_fr3_initial @ R_rel_mapped
+R_fr3_target = R_fr3_anchor @ R_rel_mapped
 ```
 
 현재 코드에서는 좌표계 방향을 확인하기 위해 OMY relative rotation을 RPY로 분해하고 `ORIENTATION_RPY_SIGN = [1, -1, -1]`을 적용한다. 이는 Euler subtraction을 통한 target 생성이 아니라, relative rotation을 진단한 뒤 rotation matrix로 재구성하는 orientation direction adjustment이다.
@@ -453,23 +453,22 @@ dq_raw = IK_GAIN * dq_raw
 dq_cmd = np.clip(dq_raw, -MAX_DQ, MAX_DQ)
 ```
 
-`dq_raw`는 clipping 전 DLS 결과이고 `dq_cmd`는 joint-step limit을 적용한 command이다. 현재 CSV logging은 `ENABLE_CSV_LOGGING = False`로 비활성화되어 있다.
+`dq_raw`는 clipping 전 DLS 결과이고 `dq_cmd`는 joint-step limit을 적용한 command이다. 현재 CSV logging은 `ENABLE_CSV_LOGGING = True`이며 실행별 `logs/target_anchor_TIMESTAMP.csv`에 기록한다.
 
 ## 4. Clutch re-anchoring 구현 상태
 
 재클러치에서 최초 runtime pose를 계속 사용하면 OMY와 FR3가 이미 이동한 뒤 Trigger를 다시 눌렀을 때 target discontinuity가 발생할 수 있다. OMY anchor만 새로 저장하고 FR3 anchor를 갱신하지 않는 경우 position/orientation error spike와 joint-step saturation으로 이어질 수 있다.
 
-현재 working tree의 실제 Trigger rising-edge 코드는 다음을 수행한다.
+현재 Trigger rising-edge 코드는 OMY current pose와 당시 유지 중인 FR3 target pose를 하나의 clutch anchor pair로 저장한다.
 
 ```python
-omy_initial_position = omy_current_position.copy()
-omy_initial_rotation = omy_current_rotation.copy()
-fr3_initial_position, fr3_initial_rotation = read_site_pose(
-    fr3_data, fr3_ee_site_id
-)
+omy_anchor_position = omy_current_position.copy()
+omy_anchor_rotation = omy_current_rotation.copy()
+fr3_anchor_position = fr3_target_position.copy()
+fr3_anchor_rotation = fr3_target_rotation.copy()
 ```
 
-즉, 현재 코드에서는 OMY current pose와 FR3 current actual pose를 같은 Trigger edge에서 캡처한다. `fr3_target_position` 및 `fr3_target_rotation`을 FR3 anchor로 사용하는 target-based re-anchoring은 아직 코드에 반영되어 있지 않다. 따라서 clutch continuity는 최종 완료가 아니라 다음 수정·검증 항목으로 분류한다. Trigger OFF 동안에는 마지막 FR3 target과 command를 유지한다.
+이후 position과 orientation target은 모두 이 anchor pair 기준으로 계산한다. Trigger OFF 동안에는 마지막 FR3 target과 command를 유지하며, rising edge에서 target anchor jump를 mm/deg로 출력한다. `fr3_q_command`는 재클러치 시 reset하지 않고 기존 command state를 유지한다.
 
 상세한 원인 분석과 권장 anchor pair 구조는 [debugging.md](debugging.md)에 분리해 기록한다.
 
@@ -492,7 +491,7 @@ fr3_initial_position, fr3_initial_rotation = read_site_pose(
 
 `logs/MAX_DQ_0.004_v2.csv` 기준으로 확인된 값은 position error peak 약 `7.78 mm`, orientation tracking error peak 약 `10.02 deg`, maximum joint step `0.004 rad`이다. 그래프에서는 OMY와 FR3 target orientation이 대체로 같은 방향으로 생성되고, FR3 actual orientation은 빠른 구간에서 lag를 보인 뒤 target을 따라간다.
 
-이 결과는 MuJoCo의 특정 로그 세션에 대한 관찰이며, 동일 입력 궤적을 사용한 엄밀한 benchmark는 아니다. 또한 현재 working tree에서는 CSV logging을 비활성화했으므로 새 실행이 자동으로 이 CSV를 갱신하지 않는다.
+이 결과는 MuJoCo의 특정 로그 세션에 대한 관찰이며, 동일 입력 궤적을 사용한 엄밀한 benchmark는 아니다. 최신 코드에서는 CSV를 실행별 `logs/target_anchor_TIMESTAMP.csv`로 기록한다.
 
 ## 7. 최초 결과와 최종 결과 비교
 

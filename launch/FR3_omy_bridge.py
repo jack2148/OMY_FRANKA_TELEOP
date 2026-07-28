@@ -23,8 +23,8 @@ from sensor_msgs.msg import JointState
 ROOT = Path(__file__).resolve().parents[1]
 OMY_MODEL_PATH = ROOT / "robotis_mujoco_menagerie" / "robotis_omy" / "scene.xml"
 FR3_MODEL_PATH = ROOT / "mujoco_menagerie" / "franka_fr3" / "scene.xml"
-# Temporarily disabled while focusing on runtime behavior.
-ENABLE_CSV_LOGGING = False
+# Enable per-run logging for clutch jump and command saturation validation.
+ENABLE_CSV_LOGGING = True
 
 OMY_ROS_JOINTS = [f"joint{i}" for i in range(1, 7)]
 OMY_MUJOCO_JOINTS = [f"Joint{i}" for i in range(1, 7)]
@@ -153,16 +153,16 @@ def rotation_matrix_to_rotvec_deg(rotation):
 
 
 def print_orientation_debug(
-    omy_initial_rotation,
+    omy_anchor_rotation,
     omy_current_rotation,
-    fr3_initial_rotation,
+    fr3_anchor_rotation,
     fr3_target_rotation,
     fr3_current_rotation,
 ):
-    """Print all rotations relative to the same runtime initial pose."""
-    omy_relative = omy_initial_rotation.T @ omy_current_rotation
-    target_relative = fr3_initial_rotation.T @ fr3_target_rotation
-    actual_relative = fr3_initial_rotation.T @ fr3_current_rotation
+    """Print all rotations relative to the current clutch anchor pair."""
+    omy_relative = omy_anchor_rotation.T @ omy_current_rotation
+    target_relative = fr3_anchor_rotation.T @ fr3_target_rotation
+    actual_relative = fr3_anchor_rotation.T @ fr3_current_rotation
     tracking_error = fr3_target_rotation @ fr3_current_rotation.T
 
     print(
@@ -258,8 +258,9 @@ def main():
     mujoco.mj_forward(fr3_model, fr3_data)
     fr3_ee_site_id = site_id(fr3_model, "attachment_site")
 
-    fr3_home_position, _ = read_site_pose(
-        fr3_data, fr3_ee_site_id
+    fr3_home_position, fr3_home_rotation = read_site_pose(
+        fr3_data,
+        fr3_ee_site_id,
     )
 
     fr3_joint_ids = np.array(
@@ -308,13 +309,19 @@ def main():
     last_loop_time = time.monotonic()
     log_step = 0
     return_near_omy_home = False
+    run_id = time.strftime("%Y%m%d_%H%M%S")
+    log_path = ROOT / "logs" / f"target_anchor_{run_id}.csv"
 
     # XML home initializes the displayed FR3. The actual reference is captured
     # on each OFF -> ON trigger edge.
     position_mode_active = False
-    omy_initial_position = None
-    fr3_initial_position = None
+    omy_anchor_position = None
+    omy_anchor_rotation = None
     fr3_target_position = fr3_home_position.copy()
+    fr3_target_rotation = fr3_home_rotation.copy()
+    fr3_anchor_position = fr3_target_position.copy()
+    fr3_anchor_rotation = fr3_target_rotation.copy()
+
     fr3_q_command = fr3_home_q.copy()
 
     try:
@@ -346,18 +353,24 @@ def main():
                     not position_mode_active
                     and trigger_position <= TRIGGER_ON_THRESHOLD
                 ):
-                    # Capture a new clutch/reference pose exactly when the
-                    # position mode is enabled. Keep it fixed while ON.
-                    omy_initial_position = omy_current_position.copy()
-                    omy_initial_rotation = omy_current_rotation.copy()
-                    fr3_q_command = fr3_data.ctrl[fr3_actuator_indices].copy()
-                    fr3_initial_position, fr3_initial_rotation = read_site_pose(
-                        fr3_data, fr3_ee_site_id
-                    )
+                    previous_target_position = fr3_target_position.copy()
+                    previous_target_rotation = fr3_target_rotation.copy()
+                    omy_anchor_position = omy_current_position.copy()
+                    omy_anchor_rotation = omy_current_rotation.copy()
+                    fr3_anchor_position = fr3_target_position.copy()
+                    fr3_anchor_rotation = fr3_target_rotation.copy()
                     position_mode_active = True
+                    return_near_omy_home = True
+
+                    target_position_jump_mm = np.linalg.norm(
+                        fr3_anchor_position - previous_target_position
+                    ) * 1000.0
+                    target_rotation_jump_deg = rotation_matrix_to_angle_deg(
+                        previous_target_rotation.T @ fr3_anchor_rotation
+                    )
 
                     omy_delta_rotation = (
-                        omy_initial_rotation.T @ omy_current_rotation
+                        omy_anchor_rotation.T @ omy_current_rotation
                     )
 
                     print("R_omy_delta at trigger ON:", omy_delta_rotation)
@@ -370,9 +383,11 @@ def main():
                         ),
                     )
 
-                    print("Position mode ON")
-                    print("Runtime initial OMY EE pose captured")
-                    print("Runtime initial FR3 EE pose captured")
+                    print(
+                        "Position mode ON | target anchor jump: "
+                        f"{target_position_jump_mm:.4f} mm, "
+                        f"{target_rotation_jump_deg:.4f} deg"
+                    )
 
                 elif (
                     position_mode_active
@@ -389,13 +404,13 @@ def main():
                     continue
 
                 # Keep the validated position target calculation unchanged.
-                delta_position_omy = omy_current_position - omy_initial_position
+                delta_position_omy = omy_current_position - omy_anchor_position
                 delta_position_fr3 = POSITION_SCALE * (
                     AXIS_MAP @ delta_position_omy
                 )
-                fr3_target_position = fr3_initial_position + delta_position_fr3
+                fr3_target_position = fr3_anchor_position + delta_position_fr3
                 omy_delta_rotation = (
-                    omy_initial_rotation.T @ omy_current_rotation
+                    omy_anchor_rotation.T @ omy_current_rotation
                 )
                 omy_delta_rpy = rotation_matrix_to_rpy(omy_delta_rotation)
                 omy_delta_rotation_for_target = rpy_to_rotation_matrix(
@@ -406,7 +421,7 @@ def main():
                     @ omy_delta_rotation_for_target
                     @ R_FR3_FROM_OMY_ORIENTATION.T
                 )
-                fr3_target_rotation = fr3_initial_rotation @ fr3_delta_rotation
+                fr3_target_rotation = fr3_anchor_rotation @ fr3_delta_rotation
                 draw_target_marker(
                     viewer,
                     fr3_target_position,
@@ -436,10 +451,10 @@ def main():
                 )
                 if is_near_omy_home and not return_near_omy_home:
                     fr3_return_pos_error = np.linalg.norm(
-                        fr3_current_position - fr3_initial_position
+                        fr3_current_position - fr3_anchor_position
                     )
                     fr3_return_rotation_error = (
-                        fr3_initial_rotation @ fr3_current_rotation.T
+                        fr3_anchor_rotation @ fr3_current_rotation.T
                     )
                     fr3_return_rot_error_deg = rotation_matrix_to_angle_deg(
                         fr3_return_rotation_error
@@ -499,9 +514,8 @@ def main():
                 mujoco.mj_step(fr3_model, fr3_data)
                 log_step += 1
 
-                # CSV experiment logging is temporarily disabled.
+                # Record every fifth active control cycle.
                 if ENABLE_CSV_LOGGING and log_step % 5 == 0:
-                    log_path = ROOT / "logs" / "MAX_DQ_0.004_v2.csv"
                     log_path.parent.mkdir(parents=True, exist_ok=True)
                     log_exists = log_path.exists()
                     with log_path.open("a", newline="") as log_file:
@@ -526,10 +540,10 @@ def main():
                             "position_error_norm": np.linalg.norm(position_error),
                             "omy_relative_angle_deg": rotation_matrix_to_angle_deg(omy_delta_rotation),
                             "fr3_target_angle_deg": rotation_matrix_to_angle_deg(
-                                fr3_initial_rotation.T @ fr3_target_rotation
+                                fr3_anchor_rotation.T @ fr3_target_rotation
                             ),
                             "fr3_actual_angle_deg": rotation_matrix_to_angle_deg(
-                                fr3_initial_rotation.T @ fr3_current_rotation
+                                fr3_anchor_rotation.T @ fr3_current_rotation
                             ),
                             "orientation_error_deg": rotation_matrix_to_angle_deg(
                                 rotation_error_matrix
@@ -561,7 +575,7 @@ def main():
                     tracking_error = np.linalg.norm(position_error)
                     rotational_tracking_error = np.linalg.norm(rotation_error)
                     return_error = np.linalg.norm(
-                        fr3_current_position - fr3_initial_position
+                        fr3_current_position - fr3_anchor_position
                     )
                     print("OMY current position:", omy_current_position)
                     print("OMY delta position:", delta_position_omy)
@@ -591,9 +605,9 @@ def main():
                     print(f"return error: {return_error * 1000:.2f} mm")
                     print(f"max joint step: {max_joint_step:.6f} rad")
                     print_orientation_debug(
-                        omy_initial_rotation,
+                        omy_anchor_rotation,
                         omy_current_rotation,
-                        fr3_initial_rotation,
+                        fr3_anchor_rotation,
                         fr3_target_rotation,
                         fr3_current_rotation,
                     )
