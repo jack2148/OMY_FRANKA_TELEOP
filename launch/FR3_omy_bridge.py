@@ -38,6 +38,7 @@ ENABLE_LOGGING = True
 
 CONTROL_HZ = 1000.0
 CONTROL_DT = 1.0 / CONTROL_HZ
+GRAVITY = np.array([0.0, 0.0, -9.81])
 VIEWER_HZ = 30.0
 LOG_HZ = 100.0
 PRINT_HZ = 1.0
@@ -467,6 +468,9 @@ def main():
     # FR3 model: IK + actuator dynamics.
     fr3_model = mujoco.MjModel.from_xml_path(str(FR3_MODEL_PATH))
     fr3_model.opt.timestep = CONTROL_DT
+    # Make the physical simulation setting explicit. The FR3 XML currently
+    # has the same MuJoCo default, but do not rely on that implicit value.
+    fr3_model.opt.gravity[:] = GRAVITY
     fr3_data = mujoco.MjData(fr3_model)
     mujoco.mj_resetDataKeyframe(
         fr3_model,
