@@ -73,6 +73,8 @@ ORIENTATION_SCALE = 0.30
 MAX_TARGET_LINEAR_SPEED = 0.10       # m/s
 MAX_TARGET_ANGULAR_SPEED = 2.0      # rad/s
 MAX_TARGET_ANGULAR_ACCEL = 2.0      # rad/s^2
+TARGET_ROTATION_KP = 4.0             # 1/s, target conditioning
+ROTATION_SNAP_ERROR = 1e-4           # rad
 
 # Task-space feedback used to generate a desired Cartesian twist.
 POSITION_KP = 8.0                    # 1/s
@@ -215,6 +217,14 @@ def limit_norm(vector, max_norm):
     return vector * (max_norm / norm)
 
 
+def rotation_distance_deg(reference_rotation, current_rotation):
+    """Return the magnitude of the relative rotation in degrees."""
+    relative_rotation = current_rotation @ reference_rotation.T
+    return float(
+        np.rad2deg(np.linalg.norm(matrix_to_rotvec(relative_rotation)))
+    )
+
+
 # ---------------------------------------------------------------------------
 # Target generation and conditioning
 # ---------------------------------------------------------------------------
@@ -262,23 +272,36 @@ def condition_target(
     next_position = current_target_position + position_step
 
     target_rotation_error = desired_rotation @ current_target_rotation.T
-    desired_angular_velocity = matrix_to_rotvec(target_rotation_error)
-    desired_angular_velocity /= max(dt, 1e-9)
-    desired_angular_velocity = limit_norm(
-        desired_angular_velocity,
-        MAX_TARGET_ANGULAR_SPEED,
-    )
-    delta_angular_velocity = desired_angular_velocity - previous_angular_velocity
-    delta_angular_velocity = limit_norm(
-        delta_angular_velocity,
-        MAX_TARGET_ANGULAR_ACCEL * dt,
-    )
-    angular_velocity = previous_angular_velocity + delta_angular_velocity
-    rotation_step = angular_velocity * dt
-    next_rotation = (
-        rotvec_to_matrix(rotation_step)
-        @ current_target_rotation
-    )
+    rotation_error = matrix_to_rotvec(target_rotation_error)
+    error_angle = float(np.linalg.norm(rotation_error))
+
+    if error_angle < ROTATION_SNAP_ERROR:
+        next_rotation = desired_rotation.copy()
+        angular_velocity = np.zeros(3)
+    else:
+        direction = rotation_error / error_angle
+        stopping_speed = np.sqrt(
+            2.0 * MAX_TARGET_ANGULAR_ACCEL * error_angle
+        )
+        desired_speed = min(
+            TARGET_ROTATION_KP * error_angle,
+            MAX_TARGET_ANGULAR_SPEED,
+            stopping_speed,
+        )
+        desired_angular_velocity = direction * desired_speed
+        delta_angular_velocity = (
+            desired_angular_velocity - previous_angular_velocity
+        )
+        delta_angular_velocity = limit_norm(
+            delta_angular_velocity,
+            MAX_TARGET_ANGULAR_ACCEL * dt,
+        )
+        angular_velocity = previous_angular_velocity + delta_angular_velocity
+        rotation_step = angular_velocity * dt
+        next_rotation = (
+            rotvec_to_matrix(rotation_step)
+            @ current_target_rotation
+        )
 
     linear_speed = float(np.linalg.norm(position_step) / max(dt, 1e-9))
     angular_speed = float(np.linalg.norm(angular_velocity))
@@ -506,6 +529,9 @@ def main():
         fr3_data,
         fr3_ee_site_id,
     )
+    fr3_command_position = fr3_target_position.copy()
+    fr3_command_rotation = fr3_target_rotation.copy()
+    fr3_initial_command_rotation = fr3_command_rotation.copy()
     hold_q_target = q_home.copy()
 
     jacp = np.zeros((3, fr3_model.nv))
@@ -527,11 +553,12 @@ def main():
     ros_thread.start()
 
     teleop_active = False
+    clutch_id = 0
     target_angular_velocity = np.zeros(3)
     omy_anchor_position = None
     omy_anchor_rotation = None
-    fr3_anchor_position = fr3_target_position.copy()
-    fr3_anchor_rotation = fr3_target_rotation.copy()
+    fr3_anchor_position = fr3_command_position.copy()
+    fr3_anchor_rotation = fr3_command_rotation.copy()
 
     next_tick = time.perf_counter()
     last_viewer_sync = next_tick
@@ -592,22 +619,38 @@ def main():
                     not teleop_active
                     and trigger_position <= TRIGGER_ON_THRESHOLD
                 ):
+                    clutch_id += 1
                     omy_anchor_position = omy_current_position.copy()
                     omy_anchor_rotation = omy_current_rotation.copy()
-                    fr3_anchor_position = fr3_target_position.copy()
-                    fr3_anchor_rotation = fr3_target_rotation.copy()
+                    fr3_anchor_position = fr3_command_position.copy()
+                    fr3_anchor_rotation = fr3_command_rotation.copy()
                     teleop_active = True
-                    print("Teleoperation ON: new target-based anchor pair")
+                    target_angular_velocity = np.zeros(3)
+                    command_anchor_angle_deg = rotation_distance_deg(
+                        fr3_initial_command_rotation,
+                        fr3_anchor_rotation,
+                    )
+                    print(
+                        f"Teleoperation ON: clutch={clutch_id} | "
+                        f"command anchor angle={command_anchor_angle_deg:.2f} deg"
+                    )
 
                 elif (
                     teleop_active
                     and trigger_position >= TRIGGER_OFF_THRESHOLD
                 ):
                     teleop_active = False
-                    print("Teleoperation OFF: holding last Cartesian target")
+                    held_command_angle_deg = rotation_distance_deg(
+                        fr3_initial_command_rotation,
+                        fr3_command_rotation,
+                    )
+                    print(
+                        f"Teleoperation OFF: clutch={clutch_id} | "
+                        f"held command angle={held_command_angle_deg:.2f} deg"
+                    )
 
                 if teleop_active:
-                    desired_position, desired_rotation = make_desired_target(
+                    fr3_command_position, fr3_command_rotation = make_desired_target(
                         omy_anchor_position,
                         omy_anchor_rotation,
                         omy_current_position,
@@ -615,29 +658,68 @@ def main():
                         fr3_anchor_position,
                         fr3_anchor_rotation,
                     )
-                    (
-                        fr3_target_position,
-                        fr3_target_rotation,
-                        target_linear_speed,
-                        target_angular_speed,
-                        target_angular_velocity,
-                    ) = condition_target(
-                        fr3_target_position,
-                        fr3_target_rotation,
-                        desired_position,
-                        desired_rotation,
-                        target_angular_velocity,
-                        CONTROL_DT,
+
+                (
+                    fr3_target_position,
+                    fr3_target_rotation,
+                    target_linear_speed,
+                    target_angular_speed,
+                    target_angular_velocity,
+                ) = condition_target(
+                    fr3_target_position,
+                    fr3_target_rotation,
+                    fr3_command_position,
+                    fr3_command_rotation,
+                    target_angular_velocity,
+                    CONTROL_DT,
+                )
+
+                if not teleop_active:
+                    command_position_gap = np.linalg.norm(
+                        fr3_command_position - fr3_target_position
                     )
-                else:
-                    target_linear_speed = 0.0
-                    target_angular_speed = 0.0
-                    target_angular_velocity = np.zeros(3)
+                    command_rotation_gap = np.linalg.norm(
+                        matrix_to_rotvec(
+                            fr3_command_rotation @ fr3_target_rotation.T
+                        )
+                    )
+                    if (
+                        command_position_gap < 1e-6
+                        and command_rotation_gap < 1e-4
+                    ):
+                        target_angular_velocity = np.zeros(3)
             else:
                 teleop_active = False
                 target_linear_speed = 0.0
                 target_angular_speed = 0.0
                 target_angular_velocity = np.zeros(3)
+                fr3_command_position = fr3_target_position.copy()
+                fr3_command_rotation = fr3_target_rotation.copy()
+
+            if omy_anchor_rotation is None or not ros_fresh:
+                omy_relative_rotation_deg = 0.0
+            else:
+                omy_relative_rotation_deg = float(
+                    np.rad2deg(
+                        np.linalg.norm(
+                            matrix_to_rotvec(
+                                omy_anchor_rotation.T @ omy_current_rotation
+                            )
+                        )
+                    )
+                )
+            fr3_command_cumulative_rotation_deg = rotation_distance_deg(
+                fr3_initial_command_rotation,
+                fr3_command_rotation,
+            )
+            fr3_target_cumulative_rotation_deg = rotation_distance_deg(
+                fr3_initial_command_rotation,
+                fr3_target_rotation,
+            )
+            command_target_rotation_gap_deg = rotation_distance_deg(
+                fr3_target_rotation,
+                fr3_command_rotation,
+            )
 
             if teleop_active:
                 q_target, diagnostics = compute_joint_target(
@@ -702,6 +784,17 @@ def main():
                     "sim_time": float(fr3_data.time),
                     "teleop_active": int(teleop_active),
                     "ros_fresh": int(ros_fresh),
+                    "clutch_id": clutch_id,
+                    "omy_relative_rotation_deg": omy_relative_rotation_deg,
+                    "fr3_command_cumulative_rotation_deg": (
+                        fr3_command_cumulative_rotation_deg
+                    ),
+                    "fr3_target_cumulative_rotation_deg": (
+                        fr3_target_cumulative_rotation_deg
+                    ),
+                    "command_target_rotation_gap_deg": (
+                        command_target_rotation_gap_deg
+                    ),
                     "position_error_mm": 1000.0 * diagnostics["position_error_m"],
                     "orientation_error_deg": diagnostics["orientation_error_deg"],
                     "target_linear_speed_mps": target_linear_speed,
@@ -720,6 +813,11 @@ def main():
                 print(
                     f"pos={1000.0 * diagnostics['position_error_m']:.2f} mm | "
                     f"rot={diagnostics['orientation_error_deg']:.2f} deg | "
+                    f"clutch={clutch_id} | "
+                    f"omy_rel={omy_relative_rotation_deg:.2f} deg | "
+                    f"cmd={fr3_command_cumulative_rotation_deg:.2f} deg | "
+                    f"target={fr3_target_cumulative_rotation_deg:.2f} deg | "
+                    f"gap={command_target_rotation_gap_deg:.2f} deg | "
                     f"qdot={diagnostics['cmd_max_qdot']:.3f} rad/s | "
                     f"cond={diagnostics['jacobian_condition']:.1f}"
                 )
