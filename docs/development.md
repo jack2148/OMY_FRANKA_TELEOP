@@ -1,790 +1,549 @@
-# FR3–OMY Cartesian Teleoperation Development Log
+# OMY–FR3 Cartesian 텔레오퍼레이션 개발 문서
 
-최초 작성: 2026-07-23<br>
-최종 수정: 2026-07-28
+> Current architecture and implementation reference
 
-> Current status: 6D position-orientation teleoperation and target-based clutch re-anchoring are operational in MuJoCo, while standardized quantitative evaluation remains incomplete.
+## 1. 문서 목적과 구현 범위
 
-## Phase 1 — Position-only Cartesian Teleoperation
+이 문서는 실제 OMY-L100 leader의 joint state를 MuJoCo OMY FK와 Cartesian
+retargeting을 거쳐 MuJoCo FR3 command로 변환하는 현재 architecture를 설명한다.
 
-Status: Completed on 2026-07-24
+현재 bridge는 `position_only`, `orientation_only`, `full_pose`를 지원하며,
+MuJoCo free-space에서 unilateral Cartesian teleoperation을 검증하는 baseline이다.
 
-![Position-only Cartesian teleoperation](images/teleop/development/position_only_cartesian_teleoperation.gif)
+설치·실행·CLI 사용법은 [README.md](../README.md), 원인과 증거 중심의 debugging
+기록은 [position_mode_debugging.md](position_mode_debugging.md)에서 다룬다.
+실제 FR3, joystick, hardware assistance, precision/contact/haptic은 후속 범위다.
 
-위 GIF는 orientation retargeting과 rotational IK를 연결하기 전, 현재 기준으로 보존한 position-only Cartesian teleoperation 동작을 보여준다.
+## 2. 시스템 아키텍처
 
-## 1. 목표 및 현재 결과
-
-이 시스템의 목표는 실제 OMY-L100 리더암의 ROS joint state를 MuJoCo OMY 모델에 적용하고, OMY EE의 Cartesian position 변화를 FR3 MuJoCo의 target position으로 전달하는 것이다.
-
-현재 다음 기능을 구현하였다.
-
-- 실제 OMY-L100의 `/leader/joint_states` 수신
-- OMY MuJoCo 모델의 joint qpos 실시간 동기화
-- `mujoco.mj_forward()` 기반 OMY EE pose 계산
-- Trigger ON 시 OMY·FR3 runtime initial pose 캡처
-- OMY EE position displacement의 FR3 target position 변환
-- translational DLS IK를 이용한 FR3 MuJoCo EE target 추종
-- FR3 position actuator command 적용
-- 전후·좌우·상하 position teleoperation 동작 확인
-
-현재 실제 OMY-L100의 전후·좌우·상하 움직임을 FR3 MuJoCo EE position으로 전달하는 position-only Cartesian teleoperation MVP를 구현하였다.
-
-현재 IK objective에는 EE position error만 포함하며, OMY orientation retargeting과 rotational IK는 구현하지 않았다.
-
-## 2. 시스템 구성과 EE 기준
-
-전체 파이프라인:
+현재 end-to-end data flow는 다음과 같다.
 
 ```text
-실제 OMY-L100
-→ /leader/joint_states
-→ OMY MuJoCo qpos
-→ mujoco.mj_forward()
-→ omy_ee_site pose
-→ runtime-relative displacement
-→ operator-frame position mapping
-→ FR3 target position
-→ translational DLS IK
-→ FR3 position actuator
+OMY-L100 /leader/joint_states
+  → joint name 기반 state extraction
+  → OMY MuJoCo qpos synchronization
+  → mujoco.mj_forward()
+  → OMY EE current pose
+  → clutch-relative Cartesian increment
+  → position/orientation frame mapping
+  → cumulative logical command pose
+  → rate-limited conditioned target pose
+  → Cartesian task velocity
+  → velocity-based DLS IK
+  → optional null-space posture velocity
+  → joint-speed limiting
+  → qdot * dt integration
+  → FR3 actuator position command
+  → MuJoCo FR3 actual state
+
 ```
 
-| Robot | MuJoCo model | EE site |
+| Component | Responsibility | Source |
 |---|---|---|
-| OMY-L100 | OMY MJCF | `omy_ee_site` |
-| FR3 | MuJoCo Menagerie FR3 | `attachment_site` |
+| OMY state interface | `/leader/joint_states` 수신, joint name 확인 및 최신 state 저장 | `OmyPose`, `FR3_omy_bridge.py` |
+| OMY FK | 수신 joint를 OMY MuJoCo `qpos`에 반영하고 EE pose 계산 | `main()`, `read_site_pose()` |
+| Clutch mapper | runtime anchor 기준 relative motion과 cumulative command 생성 | `make_desired_target()`, main loop |
+| Target conditioner | command pose를 speed/acceleration 제한 target으로 변환 | `condition_target()` |
+| DLS controller | Cartesian task를 FR3 joint velocity로 변환 | `compute_joint_target()`, `dls_pseudoinverse()` |
+| Null-space controller | optional `q_home` posture objective 계산 | `compute_joint_target()` 내부 SVD 기반 projector |
+| FR3 simulator interface | actuator command 적용, MuJoCo step, actual EE pose 조회 | main loop |
+| Logger | pose, target dynamics, IK diagnostics를 실행별 CSV로 저장 | `write_log()`, main loop |
 
-OMY EE site:
+현재 별도의 `ClutchMapper` 또는 `TargetConditioner` class는 없으며, 해당
+책임은 함수와 main loop state가 담당한다.
 
-```xml
-<site
-    name="omy_ee_site"
-    pos="0 -0.109 0"
-    size="0.01"
-    rgba="0 1 0 1"
-/>
-```
+## 3. 주요 상태와 데이터 소유권
 
-FR3 EE site:
+### Leader state
 
-```xml
-<site
-    name="attachment_site"
-    pos="0 0 0.107"
-/>
-```
+`OmyPose`가 `/leader/joint_states`에서 필요한 이름을 확인한 뒤 최신 OMY
+joint state, trigger 값, 수신 시각을 state lock 아래에 저장한다.
 
-MuJoCo site pose 조회:
+- OMY current joint state: `joint_positions`
+- OMY current EE pose: `omy_current_position`, `omy_current_rotation`
+- OMY clutch anchor pose: `omy_anchor_position`, `omy_anchor_rotation`
+- clutch ID: `clutch_id`
 
-```python
-position = data.site_xpos[site_id].copy()
-rotation = data.site_xmat[site_id].reshape(3, 3).copy()
-```
+### Logical command
 
-현재 IK objective에는 `position`만 사용한다. `rotation`은 pose 확인을 위해 조회할 수 있지만 현재 DLS 오차항에는 포함하지 않는다.
+`fr3_command_position`, `fr3_command_rotation`은 OMY motion을 누적한
+unconditioned command pose다. speed/acceleration limit을 적용하기 전의
+logical reference이며 다음 clutch의 FR3 anchor로 사용된다.
 
-## Base-frame pose inspection
+### Conditioned target
 
-Base-frame retargeting을 구현하기 전, 현재 MuJoCo 모델의 base와 EE frame을
-다음과 같이 확인한다.
+`fr3_target_position`, `fr3_target_rotation`은 logical command를 향해
+`condition_target()`이 제한된 속도와 가속도로 이동시키는 current target이다.
+함께 유지되는 state는 `target_linear_velocity`와 `target_angular_velocity`다.
 
-| Robot | Base body | EE site | Base frame alignment |
-|---|---|---|---|
-| OMY-L100 | `base_unit` | `omy_ee_site` | model world frame과 identity-aligned |
-| FR3 | `base` | `attachment_site` | model world frame과 identity-aligned |
+### Actual follower state
 
-각 모델에서 다음 변환을 사용한다.
+FR3 actual q와 EE pose는 MuJoCo `data.qpos` 및 site state에서 읽는다.
+actual pose는 command anchor를 대체하지 않으며, Cartesian task error와
+tracking diagnostics 계산에 사용된다.
+
+### Joint command state
+
+| State | 갱신 주체 | Trigger ON | Trigger OFF | ROS timeout |
+|---|---|---|---|---|
+| `omy_anchor_*` | main loop | 현재 OMY pose로 새로 저장 | 유지 | 마지막 값 유지 |
+| `fr3_command_*` | main loop | 현재 logical command를 anchor로 사용 후 active 중 갱신 | 마지막 command 유지 | 현재 conditioned target로 freeze |
+| `fr3_target_*` | `condition_target()` | command를 향해 갱신 | command에 계속 수렴 | stale branch에서 command와 함께 target 기준으로 freeze |
+| target velocity | `condition_target()` | zero로 시작 후 갱신 | 수렴 과정 동안 유지 | zero로 reset |
+| `hold_q_target` | main loop/IK | qdot 적분 결과로 갱신 | target 수렴 후 hold | 마지막 actuator command hold |
+
+Trigger rising edge에서 `fr3_anchor_position/rotation`은 actual FR3 pose가
+아니라 현재 `fr3_command_position/rotation`에서 캡처된다. Trigger OFF는
+leader 입력만 중단하고 마지막 logical command는 유지한다.
+
+## 4. OMY 상태 수신과 Forward Kinematics
+
+`OmyPose.joint_state_callback()`은 `/leader/joint_states` 메시지에서 다음
+이름을 요구한다.
 
 ```text
-T_world_base = pose(base body)
-T_world_ee   = pose(EE site)
-T_base_ee    = inverse(T_world_base) @ T_world_ee
+joint1, joint2, joint3, joint4, joint5, joint6, rh_r1_joint
+
 ```
 
-현재 home keyframe에서 두 base body의 world position은 `[0, 0, 0]`이고,
-world rotation은 identity matrix이다. 따라서 현재 모델에서는 base-relative
-EE pose를 계산할 때 추가적인 base-frame 회전 보정이 필요하지 않다. 단, 이것은
-현재 MuJoCo 모델의 정렬 상태에 대한 진단이며, 실제 로봇 설치 frame과의 일치를
-의미하지 않는다.
+여섯 개 arm joint는 `OMY_ROS_JOINTS` 순서로 저장하고 trigger는
+`TRIGGER_JOINT = "rh_r1_joint"`에서 읽는다. 필요한 이름이 하나라도 없으면
+해당 메시지를 무시한다.
 
-`launch/FR3_omy_bridge.py`는 시작 시 두 로봇에 대해 base body/site 이름,
-world base pose, base-relative EE pose, rotation determinant와
-orthonormality error를 출력한다. Runtime CSV에는 OMY base-relative EE
-position/rotation vector와 Trigger anchor 기준의 base-frame position delta,
-spatial rotation vector를 기록한다.
+main loop는 저장된 state를 OMY MuJoCo model의 다음 joint 주소에 반영한다.
 
-### Base-frame inspection test protocol
+```python
+for address, position in zip(omy_qpos_addresses, omy_target):
+    omy_data.qpos[address] = position
+mujoco.mj_forward(omy_model, omy_data)
 
-Teleoperation target mapping을 바꾸지 않은 상태에서 OMY를 한 축씩 천천히
-움직이고 CSV의 `omy_clutch_base_delta_*`와
-`omy_clutch_spatial_rotvec_*`를 확인한다.
+```
 
-1. OMY base X, Y, Z 방향으로 각각 평행 이동한다. 대응하는
-   `omy_clutch_base_delta_x/y/z` 성분이 주로 증가하고, 부호가 실제 이동
-   방향과 일치하는지 확인한다.
-2. OMY base를 X, Y, Z 축으로 각각 회전한다. 대응하는
-   `omy_clutch_spatial_rotvec_x/y/z` 성분이 주로 증가하고, 회전 부호가
-   오른손 법칙과 일치하는지 확인한다.
-3. 각 실험 사이에는 Trigger OFF 후 OMY를 기준 자세로 되돌리고, 다음
-   Trigger ON으로 새 clutch anchor를 만든다.
-4. 한 번에 여러 축을 움직이지 않고, 작은 동작부터 시작해 cross-axis
-   성분과 noise를 함께 기록한다.
+OMY model은 FK 용도다. 현재 source의 frame identifiers는 다음과 같다.
 
-이 단계에서는 위 진단값을 target 생성에 사용하지 않는다. 실제
-base-frame retargeting은 이 축과 부호 검증이 끝난 다음 별도 변경으로
-적용한다.
-
-## Axis mapping calibration
-
-Position과 orientation mapping은 `POSITION_AXIS_MAP`과
-`ORIENTATION_AXIS_MAP`으로 분리되어 있다. 초기 active position mapping은
-기존 동작을 보존하기 위해 `current_90`으로 유지한다. 수동 A/B 테스트용
-position 후보는 다음과 같다.
-
-| Candidate | Mapping |
+| Item | Current value |
 |---|---|
-| `identity` | OMY X/Y/Z → FR3 X/Y/Z |
-| `current_90` | 기존 `[[0,1,0],[-1,0,0],[0,0,1]]` |
-| `same_axis` | 동일 축, `POSITION_SAME_AXIS_SIGNS`로 부호 설정 |
+| OMY model | `robotis_mujoco_menagerie/robotis_omy/scene.xml` |
+| OMY base body | `base_unit` |
+| OMY EE site | `omy_ee_site` |
+| OMY MuJoCo joints | `Joint1` … `Joint6` |
 
-`POSITION_MAP_CANDIDATE`를 직접 변경해 후보를 선택하며 자동 선택은 하지
-않는다. `TRANSLATION_CALIBRATION_MODE = True`로 켜면 orientation command는
-clutch anchor에 고정되고 translation command만 갱신된다. 이 모드는 기본적으로
-꺼져 있다.
+EE pose는 `data.site_xpos`와 `data.site_xmat`에서 읽는다. base-frame
+inspection이 필요할 때는 `read_base_ee_transform()`이
+`inverse(T_world_base) @ T_world_ee`를 계산한다.
 
-### Translation axis test protocol
+수신 state가 `ROS_TIMEOUT_S = 0.20`보다 오래되면 stale branch로 들어간다.
+이 branch에서는 teleoperation을 비활성화하고 target dynamics를 zero로
+설정하며, logical command를 현재 conditioned target로 freeze한다.
 
-각 테스트 전 Trigger OFF 후 leader를 기준 자세로 되돌리고, Trigger ON으로
-새 clutch anchor를 만든다. 한 번에 한 방향만 천천히 움직인다.
+## 5. 좌표계와 Cartesian mapping
 
-현재 기본 후보 `current_90`의 signed 변환은 다음과 같다.
+현재 source는 OMY와 FR3의 MuJoCo base body/site를 별도로 조회하고 startup
+시점에 world-frame base와 base-relative EE transform을 출력한다.
 
-```text
-[fr3_dx, fr3_dy, fr3_dz]
-= POSITION_SCALE * [omy_dy, -omy_dx, omy_dz]
-```
+| Robot | Base body | EE site |
+|---|---|---|
+| OMY | `base_unit` | `omy_ee_site` |
+| FR3 | `base` | `attachment_site` |
 
-따라서 raw OMY delta가 `[+a, 0, 0]`이면 mapped FR3 delta는
-`[0, -POSITION_SCALE*a, 0]`, `[0, +a, 0]`이면
-`[POSITION_SCALE*a, 0, 0]`, `[0, 0, +a]`이면
-`[0, 0, POSITION_SCALE*a]`가 예상된다. 실제 물리적 오른쪽·앞·위
-동작에서 raw delta의 주축과 부호를 먼저 측정하고, 이 식으로 mapped signed
-delta를 대조한다.
+`read_body_transform()`, `read_site_transform()`, `read_base_ee_transform()`이
+homogeneous transform을 구성한다. rotation은 determinant와
+orthonormality error도 출력한다. model base alignment는 실제 hardware
+설치 frame과 동일하다는 뜻이 아니다.
 
-1. 물리적 leader를 오른쪽으로 이동한다. CSV의
-   `omy_raw_clutch_position_dx/dy/dz`에서 실제로 증가하는 raw 축과 부호를
-   기록하고, `fr3_command_position_dx/dy/dz`가 의도한 FR3 오른쪽 방향으로
-   매핑되는지 확인한다.
-2. 물리적 leader를 앞으로 이동한다. raw delta의 주축과 부호를 기록하고,
-   FR3 command delta가 앞으로 이동하는지 확인한다.
-3. 물리적 leader를 위로 이동한다. raw Z 성분과 mapped FR3 Z 성분의 부호를
-   확인한다.
-4. `fr3_target_position_d*`와 `fr3_actual_position_d*`를 함께 비교해
-   rate-limited target과 실제 EE가 같은 방향으로 움직이는지 확인한다.
-
-후보 mapping은 자동으로 바꾸지 않는다. 오른쪽·앞·위의 세 실험에서 raw
-축과 mapped 축의 signed 결과를 기록한 뒤, 가장 일관된 후보를 수동으로
-선택한다.
-
-## 3. 실제 OMY joint state 기반 실시간 FK
-
-```text
-OMY-L100 실제 리더암
-    ↓
-/leader/joint_states
-    ↓
-Joint1~Joint6 이름 기준 추출
-    ↓
-OMY MuJoCo qpos 갱신
-    ↓
-mujoco.mj_forward()
-    ↓
-omy_ee_site current pose 계산
-```
-
-실시간으로 계산하는 값:
-
-- `p_omy_current`
-- `R_omy_current`
-
-![Real-time OMY-L100 Synchronization](real-time-omy-l100-synchronization.gif)
-
-실제 OMY joint state가 OMY MuJoCo 모델에 반영되고, 실제 arm motion에 따라 MuJoCo joint state와 EE pose가 갱신되는 것을 확인하였다.
-
-위 영상은 최종 FR3 teleoperation 결과가 아니라 실제 OMY joint state 수신, MuJoCo synchronization, FK 및 EE pose 계산을 검증한 결과이다.
-
-### Joint6 회전 해석
-
-OMY Joint6의 local rotation axis는 Y축이다.
-
-```xml
-<default class="Joint6">
-    <joint axis="0 1 0"/>
-</default>
-```
-
-`omy_ee_site`가 Joint6 회전축 위에 위치하면 Joint6 회전 시 EE rotation은 변하지만 EE position 변화는 작을 수 있다. 이는 FK 오류가 아니라 EE site와 회전축 사이의 기하학적 관계 때문이다. 회전축에서 벗어난 별도의 debug site를 사용하면 위치 변화를 시각적으로 확인할 수 있다.
-
-## 4. Runtime-relative Cartesian position mapping
-
-### XML home pose
-
-XML `home` keyframe은 모델 검증, EE site 확인, 시뮬레이션 초기화 및 IK 초기 자세 설정에 사용한다. Teleoperation 증분 계산의 기준으로는 사용하지 않는다.
-
-### Runtime initial pose
-
-Trigger ON 시 실제 OMY joint state를 MuJoCo에 적용하고 FK를 수행한 뒤, 해당 시점의 OMY와 FR3 EE position을 runtime initial position으로 저장한다. Rotation은 현재 position-only 구현에서 저장하거나 IK objective에 사용하지 않는다.
+Position과 orientation mapping은 독립적으로 정의된다.
 
 ```python
-p_omy_initial = p_omy_current.copy()
-p_fr3_initial = p_fr3_current.copy()
-```
-
-현재 position displacement:
-
-```python
-delta_position_omy = (
-    p_omy_current
-    - p_omy_initial
-)
-```
-
-operator-frame position mapping:
-
-```python
-AXIS_MAP = np.array([
+POSITION_AXIS_MAP = np.array([
     [0.0, 1.0, 0.0],
     [-1.0, 0.0, 0.0],
     [0.0, 0.0, 1.0],
 ])
+
+ORIENTATION_AXIS_MAP = np.array([
+    [0.0, -1.0, 0.0],
+    [-1.0, 0.0, 0.0],
+    [0.0, 0.0, -1.0],
+])
+
 ```
+
+현재 position mapping의 의미는 다음과 같다.
 
 ```text
 FR3 X =  OMY Y
 FR3 Y = -OMY X
 FR3 Z =  OMY Z
+
 ```
 
-target 계산은 실제 구현과 동일하게 `+` 부호를 사용한다.
-
-```python
-delta_position_fr3 = (
-    POSITION_SCALE
-    * (
-        AXIS_MAP
-        @ delta_position_omy
-    )
-)
-
-fr3_target_position = (
-    p_fr3_initial
-    + delta_position_fr3
-)
-```
-
-Trigger 동작:
-
-- Trigger ON rising edge에서 OMY와 FR3 runtime initial position을 저장한다.
-- Trigger ON 동안 runtime initial pose 기준 target position을 갱신한다.
-- Trigger OFF 시 OMY pose를 더 이상 반영하지 않고 마지막 target 및 command를 유지한다.
-- Trigger ON 직후 OMY delta position은 0에 가까워야 한다.
-
-`AXIS_MAP`은 조작자 기준의 전후·좌우·상하 움직임을 FR3 task frame에 대응시키기 위한 position mapping이다. 이 행렬은 position 단축 실험을 통해 확정한 mapping이다. 향후 orientation retargeting에서는 OMY와 FR3 EE frame 및 회전 방향을 별도로 검증한 뒤 재사용 여부를 결정한다.
-
-## 5. Position-only DLS IK
-
-현재 IK objective에는 position error 3개만 포함한다.
-
-```python
-position_error = (
-    fr3_target_position
-    - fr3_current_position
-)
-```
-
-MuJoCo의 translational Jacobian을 사용한다.
-
-```python
-jacp = np.zeros((3, fr3_model.nv))
-jacr = np.zeros((3, fr3_model.nv))
-
-mujoco.mj_jacSite(
-    fr3_model,
-    fr3_data,
-    jacp,
-    jacr,
-    fr3_ee_site_id,
-)
-
-J_position = jacp[:, fr3_dof_indices]
-```
-
-index 역할:
-
-- `qpos address`: 관절 상태 접근
-- `dof address`: Jacobian column 선택
-
-DLS 계산:
-
-```python
-dq = (
-    J_position.T
-    @ np.linalg.solve(
-        J_position @ J_position.T
-        + (IK_DAMPING ** 2) * np.eye(3),
-        position_error,
-    )
-)
-
-dq = IK_GAIN * dq
-dq = np.clip(dq, -MAX_DQ, MAX_DQ)
-```
-
-실제 관절 상태와 actuator command는 분리한다.
-
-```python
-q_current = fr3_data.qpos[fr3_qpos_indices].copy()
-
-fr3_q_command = np.clip(
-    fr3_q_command + dq,
-    fr3_joint_lower,
-    fr3_joint_upper,
-)
-
-fr3_data.ctrl[fr3_actuator_indices] = fr3_q_command
-mujoco.mj_step(fr3_model, fr3_data)
-```
-
-```text
-q_current
-= MuJoCo에서 측정한 실제 FR3 관절 상태
-= 현재 EE pose와 Jacobian 계산에 사용
-
-fr3_q_command
-= position actuator에 전달하는 목표 관절 상태
-= 이전 command에 dq를 연속적으로 누적
-
-dq
-= 현재 cycle에서 적용할 관절 command 수정량
-```
-
-현재 IK objective에는 orientation error를 포함하지 않는다. 따라서 OMY orientation을 FR3가 추종하지 않으며, position-only IK 동작 중 FR3 EE orientation은 관절 해에 따라 일부 변할 수 있다.
-
-## 6. 주요 디버깅 결과
-
-### 6.1 XML home pose와 runtime initial pose 혼용
-
-Trigger ON 직후 OMY delta가 0이 아니고 FR3 target이 jump하며 일부 IK joint가 limit에 포화될 수 있었다. 원인은 XML home pose를 teleoperation 기준으로 사용한 것이다.
-
-```python
-delta_p_omy = p_omy_current - p_omy_home
-```
-
-실제 joint state 수신 후 Trigger ON 시 runtime initial pose를 캡처하도록 수정하였다.
-
-```python
-delta_p_omy = p_omy_current - p_omy_initial
-```
-
-### 6.2 좌표축 매핑
-
-초기 `AXIS_MAP = I`에서는 조작자 기준 전후·좌우 움직임과 FR3 task direction이 일치하지 않았다. 단축 이동 실험으로 현재 `AXIS_MAP`을 확정하였다.
-
-### 6.3 Trigger ON 시 FR3 하강 및 진동
-
-Trigger ON 시 FR3가 아래로 내려앉거나 진동하는 현상이 발생하였다. 실제 qpos 기반 command 갱신 구조, DLS 수치 안정성, gain 및 cycle당 joint update를 함께 점검하였다. 이후 `q_current`와 지속 actuator command를 분리하고, DLS damping과 IK gain 및 joint-step limit을 보수적으로 설정하여 안정화하였다.
-
-상세 raw 디버깅 기록: [debugging.md](debugging.md)
-
-## 7. 검증 결과
-
-현재 다음 position-only 동작을 확인하였다.
-
-- Trigger ON 직후 target jump 없음
-- OMY 전후 이동에 따른 FR3 전후 추종
-- OMY 좌우 이동에 따른 FR3 좌우 추종
-- OMY 상하 이동에 따른 FR3 상하 추종
-- 정지 시 target과 FR3 EE 수렴
-- joint-limit saturation 없음
-- 눈에 띄는 발산과 진동 없음
-- OMY를 initial pose 근처로 복귀시켰을 때 FR3도 initial position 근처로 복귀
-
-대표 로그:
-
-```text
-tracking error: 0.04 mm
-return error: 2.48 mm
-max joint step: 0.000002 rad
-```
-
-위 수치는 안정화 이후 특정 cycle에서 기록한 대표 로그이며, 여러 trial의 평균 또는 최대 성능을 의미하지 않는다. return error에는 사용자가 OMY를 runtime initial pose에 정확히 되돌리지 못한 입력 오차가 포함될 수 있다.
-
-현재 코드에서 평가하는 지표:
-
-```python
-tracking_error = np.linalg.norm(
-    fr3_target_position - fr3_current_position
-)
-
-return_error = np.linalg.norm(
-    fr3_current_position - fr3_initial_position
-)
-
-max_joint_step = np.max(np.abs(dq))
-```
-
-**Position-only Cartesian teleoperation MVP completed.**
-
-현재 OMY orientation retargeting과 rotational IK는 포함하지 않는다.
-
-## 8. 현재 파라미터
-
-| Parameter | Current value |
-|---|---:|
-| `POSITION_SCALE` | `0.2` |
-| `AXIS_MAP` | `[[0,1,0],[-1,0,0],[0,0,1]]` |
-| `IK_DAMPING` | `0.05` |
-| `IK_GAIN` | `0.05` |
-| `MAX_DQ` | `0.002 rad/cycle` |
-| configured control period | `0.002 s` |
-| nominal control frequency | `500 Hz` |
-| measured control frequency | not yet evaluated |
-
-`500 Hz`는 configured loop period에서 계산한 nominal frequency이며, 실제 control frequency는 MuJoCo step 시간과 시스템 부하에 따라 달라질 수 있다.
-
-## Phase 2 — 6D Cartesian Teleoperation
-
-Status: In progress on 2026-07-28
-
-## 1. 작업 목표
-
-2026-07-27 작업에서는 실제 OMY-L100의 EE motion을 MuJoCo FR3에 retargeting하는 기존 position-only 구조를 position + orientation 6D pose 제어로 확장하였다. Trigger 기반 clutch를 사용해 제한된 leader workspace에서도 반복 조작할 수 있도록 runtime relative pose를 사용하고, OMY FK부터 FR3 joint position command까지의 전체 흐름을 단계별로 검증하는 것을 목표로 했다.
-
-## 2. 시작 상태
-
-작업 시작 전에는 다음 기능이 이미 동작했다.
-
-- `/leader/joint_states`를 MuJoCo OMY joint qpos에 반영
-- `omy_ee_site`의 EE FK 및 runtime position delta 계산
-- FR3 position target 생성
-- translational DLS IK와 FR3 position actuator command
-
-반면 orientation retargeting, rotational IK, 그리고 반복 Trigger 입력에서 OMY와 FR3의 기준 pose를 일관되게 갱신하는 clutch re-anchoring은 완전히 검증되지 않은 상태였다. XML home pose, runtime initial pose, clutch anchor의 역할도 position-only 코드 안에서 혼재할 여지가 있었다.
-
-## 3. 구현한 시스템 구조
-
-```text
-Real OMY joint state
-    → MuJoCo OMY FK
-    → OMY current EE pose (p, R)
-    → clutch runtime reference 기준 relative motion
-    → OMY-to-FR3 axis mapping
-    → FR3 target pose (p_target, R_target)
-    → 6D task error
-    → Damped Least Squares IK
-    → FR3 joint position command
-```
-
-### 3.1 Relative position
-
-현재 코드의 position target은 Trigger ON 시 저장한 OMY runtime position을 기준으로 계산한다.
-
-```python
-delta_position_omy = omy_current_position - omy_initial_position
-delta_position_fr3 = POSITION_SCALE * (AXIS_MAP @ delta_position_omy)
-fr3_target_position = fr3_initial_position + delta_position_fr3
-```
-
-현재 position mapping은 다음과 같다.
-
-```python
-AXIS_MAP = np.array([
-    [0.0, 1.0, 0.0],
-    [-1.0, 0.0, 0.0],
-    [0.0, 0.0, 1.0],
-])
-```
-
-현재는 재클러치 후에도 기존에 검증한 고정축 position mapping을 유지한다. clutch 시점 OMY local frame을 이용하는 방식은 방향 반전 문제가 확인되어 baseline에서 제외했다.
-
-### 3.2 Relative orientation
-
-Euler angle을 단순히 빼지 않고 rotation matrix의 상대변환을 계산한 뒤 rotation vector와 angle로 검증한다.
+`make_desired_target()`은 position에 `POSITION_SCALE`과
+`POSITION_AXIS_MAP`을 적용한다. orientation은 Euler subtraction이 아니라
+relative rotation matrix와 rotation vector를 사용한다.
 
 ```python
 R_omy_rel = R_omy_anchor.T @ R_omy_current
+r_omy_rel = matrix_to_rotvec(R_omy_rel)
+r_fr3 = ORIENTATION_SCALE * (ORIENTATION_AXIS_MAP @ r_omy_rel)
+R_desired = R_fr3_anchor @ rotvec_to_matrix(r_fr3)
+
 ```
 
-orientation mapping 후보는 position mapping과 분리된 변수로 유지한다.
+Position mapping 검증과 orientation sign 검증은 별개다. 현재 orientation
+validation은 upward/downward와 right/left의 반대 sign을 확인한 제한된 범위며,
+hardware installation frame calibration 또는 전체 roll/pitch/yaw 검증 완료를
+의미하지 않는다. 상세 evidence는
+[position mode debugging](position_mode_debugging.md#position-axis-mapping-error)을
+참조한다.
+
+## 6. Clutch 기반 command 생성
+
+Trigger threshold는 `TRIGGER_ON_THRESHOLD = -0.90`,
+`TRIGGER_OFF_THRESHOLD = -0.70`이다.
+
+| Event | OMY anchor | Logical command | Conditioned target | Target velocity |
+|---|---|---|---|---|
+| Trigger ON | 현재 OMY EE pose 저장 | 현재 command를 FR3 anchor로 사용 | 기존 target에서 계속 상태 유지 | linear/angular zero로 시작 |
+| Trigger active | anchor-relative OMY motion 사용 | mode에 따라 position/rotation 갱신 | command를 향해 제한 갱신 | conditioner state 유지 |
+| Trigger OFF | 마지막 anchor 유지 | 마지막 command hold | 마지막 command로 계속 수렴 | 수렴 전까지 유지 |
+| ROS timeout | 마지막 anchor 유지 | 현재 target로 freeze | stale branch에서 추가 갱신 안 함 | zero로 reset |
+
+active stroke에서 `make_desired_target()`은 OMY anchor-relative position과
+rotation을 FR3 anchor에 적용한다.
+
+```text
+OMY current pose - OMY anchor pose
+  → independent position/orientation mapping
+  → FR3 command anchor + mapped increment
+  → cumulative logical command
+
+```
+
+`position_only`에서는 FR3 rotation을 `fr3_anchor_rotation`에 hold하고,
+`orientation_only`에서는 FR3 position을 `fr3_anchor_position`에 hold한다.
+`full_pose`에서는 두 command를 모두 갱신한다. command가 누적되므로 leader가
+한 stroke에서 사용할 수 있는 workspace보다 넓은 Cartesian motion을 여러
+clutch operation으로 표현할 수 있다.
+
+## 7. Command와 conditioned target
+
+controller 입력의 상태 관계는 다음과 같다.
+
+```text
+OMY leader input
+  → cumulative logical command
+  → conditioned target
+  → FR3 actual pose
+
+```
+
+logical command에는 직접 target speed/acceleration limit을 적용하지 않는다.
+`condition_target()`은 current target에서 command로 이동하며 linear와 angular
+velocity state를 각각 유지한다.
+
+### Linear conditioner
+
+position error norm을 `e_p`라고 하면 current source는 다음 속도를 계산한다.
 
 ```python
-R_FR3_FROM_OMY_ORIENTATION = AXIS_MAP.copy()
-R_rel_mapped = (
-    R_FR3_FROM_OMY_ORIENTATION
-    @ R_omy_delta_rotation_for_target
-    @ R_FR3_FROM_OMY_ORIENTATION.T
+stopping_speed = sqrt(2 * MAX_TARGET_LINEAR_ACCEL * error_norm)
+proportional_speed = POSITION_KP * error_norm
+desired_speed = min(
+    proportional_speed,
+    MAX_TARGET_LINEAR_SPEED,
+    stopping_speed,
 )
-R_fr3_target = R_fr3_anchor @ R_rel_mapped
+
 ```
 
-현재 코드에서는 좌표계 방향을 확인하기 위해 OMY relative rotation을 RPY로 분해하고 `ORIENTATION_RPY_SIGN = [1, -1, -1]`을 적용한다. 이는 Euler subtraction을 통한 target 생성이 아니라, relative rotation을 진단한 뒤 rotation matrix로 재구성하는 orientation direction adjustment이다.
+이후 error 방향으로 desired velocity를 만들고, velocity 변화량을
+`MAX_TARGET_LINEAR_ACCEL * dt`까지 제한한 뒤 position을 velocity로 적분한다.
+snap은 위치 error와 이전/현재 velocity가 모두 작은 경우에만 허용한다.
 
-### 3.3 6D DLS IK
+### Angular conditioner
 
-현재 baseline parameter는 실제 코드에서 다음과 같다.
+angular error는 다음 relative rotation에서 rotation vector로 계산한다.
+
+```python
+R_error = R_desired @ R_target.T
+r_error = matrix_to_rotvec(R_error)
+
+```
+
+error angle에서 stopping speed를 계산하고, `TARGET_ROTATION_KP`,
+`MAX_TARGET_ANGULAR_SPEED`, `MAX_TARGET_ANGULAR_ACCEL`을 사용해 angular
+velocity를 제한한다. target rotation은 제한된 rotation step을 current target
+앞에 곱해 갱신한다. `ROTATION_SNAP_ERROR`보다 작으면 rotation을 desired pose에
+맞추고 angular velocity를 zero로 만든다.
+
+주요 conditioning parameter는 다음과 같다.
+
+- `MAX_TARGET_LINEAR_SPEED`, `MAX_TARGET_LINEAR_ACCEL`
+- `MAX_TARGET_ANGULAR_SPEED`, `MAX_TARGET_ANGULAR_ACCEL`
+- `TARGET_ROTATION_KP`
+- `POSITION_SNAP_ERROR`, `POSITION_SNAP_SPEED`
+- `ROTATION_SNAP_ERROR`
+
+Trigger OFF에서는 command만 hold하고 conditioner가 마지막 command까지
+수렴한다. ROS timeout은 stale branch로 전환되어 target dynamics를 zero로
+reset하고 logical command를 current target에 freeze한다.
+
+## 8. Teleoperation mode
+
+| Mode | Position command | Orientation command | Main use |
+|---|---|---|---|
+| `position_only` | Update | `fr3_anchor_rotation`에 hold | translation mapping/IK validation |
+| `orientation_only` | `fr3_anchor_position`에 hold | Update | orientation mapping validation |
+| `full_pose` | Update | Update | normal teleoperation |
+
+현재 default는 `TELEOP_MODE = "full_pose"`다. `full`은 지원 mode가 아니며,
+mode validation은 `SUPPORTED_TELEOP_MODES`와 main 시작부에서 수행한다.
+
+mode isolation에서는 signed position XYZ와 signed rotation-vector XYZ를
+분리해 확인한다. orientation 검증은 제한된 단일 방향 조작의 sign 확인이며,
+전체 orientation calibration 완료를 의미하지 않는다.
+
+## 9. Velocity-based DLS IK
+
+`compute_joint_target()`은 FR3 actual EE pose와 conditioned target의 차이를
+task velocity로 변환한다.
+
+```text
+position_error = p_target - p_current
+rotation_error = log(R_target R_currentᵀ)
+v_position = POSITION_KP * position_error
+v_rotation = ORIENTATION_KP * rotation_error
+
+```
+
+MuJoCo `mj_jacSite()`에서 position Jacobian `J_position`과 rotational
+Jacobian `J_rotation`을 계산한다. mode별 task는 다음과 같다.
+
+| Mode | Task Jacobian | Task velocity |
+|---|---|---|
+| `position_only` | `J_position` | `v_position` |
+| `orientation_only` | `ROTATION_LENGTH_SCALE * J_rotation` | `ROTATION_LENGTH_SCALE * v_rotation` |
+| `full_pose` | `vstack(J_position, ROTATION_LENGTH_SCALE * J_rotation)` | concatenate position/rotation task |
+
+`full_pose` task Jacobian은 6×7이다. DLS pseudoinverse는 current source에서
+다음 normal-equation 형태로 계산한다.
+
+```python
+J_dls = J.T @ solve(J @ J.T + damping**2 * I, I)
+qdot_task = J_dls @ task_velocity
+
+```
+
+`ROTATION_LENGTH_SCALE`은 rotational Jacobian과 angular task velocity 양쪽에
+적용되어 position과 rotation의 metric unit을 맞춘다.
+
+joint command 순서는 다음과 같다.
+
+```text
+qdot_task
+  → optional qdot_null addition
+  → [-MAX_JOINT_SPEED, MAX_JOINT_SPEED] clipping
+  → q_target = hold_q_target + qdot_command * dt
+  → joint range clipping
+  → data.ctrl
+
+```
+
+초기 per-cycle `dq` 제한은 frequency-dependent하여 현재는 velocity-level
+command와 `qdot * dt` 적분으로 대체되었다. `CONTROL_HZ`는 configured nominal
+rate이며 Python loop의 measured hard real-time 보장을 의미하지 않는다.
+상세 causal debugging은
+[velocity IK 전환 기록](position_mode_debugging.md#per-cycle-dq-velocity-ik)을
+참조한다.
+
+## 10. Null-space posture control
+
+FR3는 7DoF이므로 Cartesian task 외 posture 방향이 존재한다. 현재 optional
+posture objective는 `q_home`을 reference로 사용한다.
+
+```python
+qdot_posture = NULLSPACE_GAIN * (q_home - q_current)
+qdot_null = N @ qdot_posture
+qdot_total = qdot_task + qdot_null
+
+```
+
+`N`은 current task Jacobian의 SVD 기반 null-space projector다. position-only와
+full-pose는 task row 수가 다르므로 redundancy도 다르다.
+
+현재 baseline에는 OMY axis를 FR3 특정 q6/q7에 직접 매핑하는 로직이 없다.
+`ENABLE_NULLSPACE_POSTURE=True`, `NULLSPACE_GAIN=0.1`은 current experimental
+configuration이며 optimal gain을 의미하지 않는다. workspace posture benefit,
+joint-limit avoidance, task interference는 정량 검증되지 않았다.
+
+## 11. MuJoCo FR3 command 적용
+
+FR3 model은 IK와 actuator dynamics 용도로 사용한다.
+
+| Variable | Meaning | Used for |
+|---|---|---|
+| `q_current` | MuJoCo FR3 current joint position | IK state/error 계산 |
+| `hold_q_target` | held/integrated actuator command | 다음 command의 integration reference |
+| `qdot_task` | Cartesian task velocity 결과 | primary task motion |
+| `qdot_null` | null-space posture velocity | optional redundancy objective |
+| `qdot_command` | joint speed clipping 후 velocity | actuator target 적분 |
+| `q_target` | joint range clipping 후 position target | `data.ctrl` 입력 |
+
+현재 source는 `fr3_joint1`부터 `fr3_joint7`까지의 position actuator를 사용한다.
+main loop는 다음 순서로 실행한다.
+
+```python
+fr3_data.ctrl[fr3_actuator_indices] = q_target
+mujoco.mj_step(fr3_model, fr3_data)
+fr3_actual_position, fr3_actual_rotation = read_site_pose(
+    fr3_data,
+    fr3_ee_site_id,
+)
+
+```
+
+MuJoCo position actuator 구조를 real FR3 torque/position controller와 동일한
+제어기라고 해석하지 않는다.
+
+## 12. Logging 및 diagnostics
+
+`ENABLE_LOGGING=True`이면 실행 종료 시 rows를
+`logs/refactored_teleop_YYYYMMDD_HHMMSS.csv`에 저장한다.
+
+| Group | Contents |
+|---|---|
+| Teleoperation state | `teleop_mode`, active state, `clutch_id`, `wall_time`, `sim_time`, `control_dt` |
+| Cartesian state | command/target/actual position과 session-relative rotation vector |
+| Tracking | position/orientation error, command-target rotation gap |
+| Target dynamics | linear/angular speed 및 acceleration norm |
+| IK/controller | task velocity norm, raw/commanded qdot, qdot task norm |
+| Solver | task residual, Jacobian condition, joint speed saturation |
+| Joint state | `fr3_joint_1`부터 `fr3_joint_7`까지 |
+
+조건부 diagnostics flag는 다음과 같다.
+
+| Flag | Purpose |
+|---|---|
+| `ENABLE_MAPPING_DEBUG_LOGS` | OMY raw delta와 mapped position/rotation signed components |
+| `ENABLE_OMY_INTERNAL_DEBUG_LOGS` | OMY base-relative pose와 clutch-relative base diagnostics |
+| `ENABLE_NULLSPACE_DEBUG_LOGS` | 선언된 null-space diagnostics option; 현재 main loop의 CSV 분기는 없음 |
+
+기본 mapping/OMY internal debug logging은 `False`다. plot 생성 방법과 CSV
+파일 지정법은 [README의 CSV/plot section](../README.md#5-csv-확인과-plot-생성)을
+사용한다.
+
+## 13. 현재 설정
+
+현재 `launch/FR3_omy_bridge.py`에서 확인한 MuJoCo baseline은 다음과 같다.
 
 | Parameter | Current value |
 |---|---:|
-| `POSITION_SCALE` | `0.7` |
+| `TELEOP_MODE` | `"full_pose"` |
+| `POSITION_SCALE` | `0.4` |
+| `ORIENTATION_SCALE` | `0.3` |
+| `POSITION_MAP_CANDIDATE` | `"current_90"` |
+| `MAX_TARGET_LINEAR_SPEED` | `0.09 m/s` |
+| `MAX_TARGET_LINEAR_ACCEL` | `2.0 m/s²` |
+| `MAX_TARGET_ANGULAR_SPEED` | `2.0 rad/s` |
+| `MAX_TARGET_ANGULAR_ACCEL` | `4.0 rad/s²` |
+| `TARGET_ROTATION_KP` | `4.0` |
+| `POSITION_KP` | `8.0` |
+| `ORIENTATION_KP` | `4.0` |
 | `IK_DAMPING` | `0.05` |
-| `IK_GAIN` | `0.05` |
-| `ROTATION_IK_WEIGHT` | `0.1` |
-| `MAX_DQ` | `0.004 rad/cycle` |
+| `ROTATION_LENGTH_SCALE` | `0.10 m/rad` |
+| `MAX_JOINT_SPEED` | `0.80 rad/s` |
+| `ENABLE_NULLSPACE_POSTURE` | `True` |
+| `NULLSPACE_GAIN` | `0.1` |
+| `CONTROL_HZ` | `1000 Hz` |
+| `LOG_HZ` | `100 Hz` |
+| `ENABLE_LOGGING` | `True` |
+| `ENABLE_MAPPING_DEBUG_LOGS` | `False` |
+| `ENABLE_OMY_INTERNAL_DEBUG_LOGS` | `False` |
+| `ENABLE_NULLSPACE_DEBUG_LOGS` | `False` |
 
-position Jacobian `J_pos`와 angular Jacobian `J_rot`를 결합하고, rotation error에 `ROTATION_IK_WEIGHT`를 곱한다.
+`POSITION_AXIS_MAP`은 `current_90` 후보에서 선택되고,
+`ORIENTATION_AXIS_MAP`은 별도 matrix로 정의된다. threshold는
+`TRIGGER_ON_THRESHOLD=-0.90`, `TRIGGER_OFF_THRESHOLD=-0.70`,
+`POSITION_SNAP_ERROR=1e-6`, `POSITION_SNAP_SPEED=1e-3`,
+`ROTATION_SNAP_ERROR=1e-4`, `ROS_TIMEOUT_S=0.20`이다.
 
-```python
-J_task = np.vstack((J_pos, ROTATION_IK_WEIGHT * J_rot))
-e_task = np.concatenate((position_error,
-                         ROTATION_IK_WEIGHT * rotation_error))
+이 값들은 MuJoCo free-space baseline이다. `CONTROL_HZ`는 nominal configured
+rate이며 measured hard real-time rate가 아니다. real FR3 controller parameter로
+직접 사용할 수 없다.
 
-dq_raw = J_task.T @ np.linalg.solve(
-    J_task @ J_task.T + IK_DAMPING**2 * np.eye(6),
-    e_task,
-)
-dq_raw = IK_GAIN * dq_raw
-dq_cmd = np.clip(dq_raw, -MAX_DQ, MAX_DQ)
-```
+## 14. 구현 상태와 검증 범위
 
-`dq_raw`는 clipping 전 DLS 결과이고 `dq_cmd`는 joint-step limit을 적용한 command이다. 현재 CSV logging은 `ENABLE_CSV_LOGGING = True`이며 실행별 `logs/target_anchor_TIMESTAMP.csv`에 기록한다.
+| Feature | Implementation | Validation scope |
+|---|---|---|
+| OMY ROS joint-state synchronization | 구현 및 확인 | `/leader/joint_states` state path |
+| OMY MuJoCo FK | 구현 및 확인 | OMY EE site pose |
+| Runtime clutch anchor | 구현 및 확인 | tested MuJoCo clutch runs |
+| Cumulative logical command | 구현 및 확인 | repeated clutch behavior |
+| Position mapping | 구현 및 확인 | tested one-axis directions |
+| Orientation mapping | 구현 | upward/downward/right/left sign 범위 |
+| Three teleoperation modes | 구현 및 확인 | mode isolation |
+| Command-target separation | 구현 및 확인 | target convergence behavior |
+| Linear/angular conditioner | 구현 | tested MuJoCo configuration |
+| Velocity-based DLS IK | 구현 및 확인 | representative free-space runs |
+| Full-pose 6D DLS | 구현 | representative free-space runs |
+| qdot saturation logging | 구현 및 확인 | raw/commanded qdot fields |
+| Null-space posture term | 구현 완료, 정량 미검증 | workspace/posture effect 미검증 |
+| Joystick | 미구현 | 후속 범위 |
+| Passive gravity compensation | 미구현 | hardware 후속 범위 |
+| Precision/contact | 미구현 | 후속 범위 |
+| Haptic feedback | 미구현 | 후속 범위 |
+| Real FR3 | 보류 | safety validation 전 |
+| PushT dataset pipeline | 미구현 | 별도 환경 작업 |
 
-## 4. Clutch re-anchoring 구현 상태
+정량 validation의 제한은 manual trajectory, scripted replay 부재,
+workspace-wide test 부재, contact/hardware test 부재, real robot 부재다.
 
-재클러치에서 최초 runtime pose를 계속 사용하면 OMY와 FR3가 이미 이동한 뒤 Trigger를 다시 눌렀을 때 target discontinuity가 발생할 수 있다. OMY anchor만 새로 저장하고 FR3 anchor를 갱신하지 않는 경우 position/orientation error spike와 joint-step saturation으로 이어질 수 있다.
+## 15. 확장 구조
 
-현재 Trigger rising-edge 코드는 OMY current pose와 당시 유지 중인 FR3 target pose를 하나의 clutch anchor pair로 저장한다.
-
-```python
-omy_anchor_position = omy_current_position.copy()
-omy_anchor_rotation = omy_current_rotation.copy()
-fr3_anchor_position = fr3_target_position.copy()
-fr3_anchor_rotation = fr3_target_rotation.copy()
-```
-
-이후 position과 orientation target은 모두 이 anchor pair 기준으로 계산한다. Trigger OFF 동안에는 마지막 FR3 target과 command를 유지하며, rising edge에서 target anchor jump를 mm/deg로 출력한다. `fr3_q_command`는 재클러치 시 reset하지 않고 기존 command state를 유지한다.
-
-상세한 원인 분석과 권장 anchor pair 구조는 [debugging.md](debugging.md)에 분리해 기록한다.
-
-## 5. 최초 결과
-
-![Initial 6D teleoperation tracking](images/teleop/development/initial_6d_tracking.png)
-
-초기 plot에는 다음 네 값이 표시된다.
-
-- position tracking error
-- OMY / FR3 target / FR3 actual orientation
-- orientation tracking error
-- maximum joint step
-
-초기 CSV(`logs/orientation_teleop.csv`)에서 확인된 최대값은 position error 약 `756.5 mm`, orientation tracking error 약 `90.0 deg`, maximum joint step `0.004 rad`이다. 이 로그는 여러 동작 구간과 timestamp gap을 한 그래프에 연결한 기록이므로, 구간 사이의 직선은 실제 연속 동작이 아닌 plot artifact일 수 있다. 재클러치 기준 불일치와 target discontinuity 가능성이 포함된 초기 결과로 해석한다.
-
-## 6. 최종 결과
-
-![Final 6D teleoperation tracking](images/teleop/development/final_6d_tracking.png)
-
-`logs/MAX_DQ_0.004_v2.csv` 기준으로 확인된 값은 position error peak 약 `7.78 mm`, orientation tracking error peak 약 `10.02 deg`, maximum joint step `0.004 rad`이다. 그래프에서는 OMY와 FR3 target orientation이 대체로 같은 방향으로 생성되고, FR3 actual orientation은 빠른 구간에서 lag를 보인 뒤 target을 따라간다.
-
-이 결과는 MuJoCo의 특정 로그 세션에 대한 관찰이며, 동일 입력 궤적을 사용한 엄밀한 benchmark는 아니다. 최신 코드에서는 CSV를 실행별 `logs/target_anchor_TIMESTAMP.csv`로 기록한다.
-
-## 7. 최초 결과와 최종 결과 비교
-
-| 항목 | 최초 상태 | 최종 관찰 | 해석 |
-|---|---|---|---|
-| Pose control | position 중심, orientation 미검증 | position + orientation 6D DLS | 기능 확장 |
-| Orientation target mapping | 검증 전 | OMY relative와 FR3 target이 대체로 일치 | 기본 mapping 확인 |
-| Re-clutch continuity | 큰 target jump 가능 | target-based re-anchoring은 아직 미반영 | 추가 구현 필요 |
-| Peak position error | 약 756.5 mm | 약 7.78 mm | 로그 세션 기준 개선 |
-| Peak orientation error | 약 90.0 deg | 약 10.02 deg | 로그 세션 기준 개선 |
-| Joint-step limit | `0.004 rad`까지 관찰 | `0.004 rad` baseline | raw saturation ratio는 새 logging 재활성화 후 계산 |
-| Final convergence | 분석 곤란 | 저속 구간에서 target을 추종 | 빠른 동작과 재클러치 추가 검증 필요 |
-
-초기와 최종 실험의 입력 궤적 및 로그 세션이 완전히 동일하지 않으므로, 위 비교는 정량 benchmark가 아닌 개발 전후의 qualitative comparison이다.
-
-## 8. 현재 baseline
-
-완료 또는 확인된 항목:
-
-- runtime OMY FK
-- relative position retargeting
-- relative orientation retargeting
-- OMY–FR3 axis mapping 후보
-- 6D DLS IK
-- orientation marker visualization
-- target/actual/orientation error debug 출력
-- basic plot visualization
-
-남은 항목:
-
-- FR3 target 기반 clutch anchor pair 적용
-- 동일 궤적 기반 정량 비교
-- RMSE, peak error, settling time, saturation ratio 자동 계산
-- `MAX_DQ`를 `q_dot_max * dt` 방식으로 전환
-- translation-only / rotation-only / combined 표준 실험
-- joint-limit 및 singularity 처리
-- actual FR3 연결 전 safety layer
-- target velocity 및 acceleration conditioning 검토
-
-## 9. 다음 작업
-
-1. `fr3_target` 기반 clutch anchor pair 구현 및 재클러치 연속성 검증
-2. CSV logging 재활성화 후 `raw_max_dq`, `cmd_max_dq`, `dq_saturated`, `dt` 기록
-3. 느린 단축 왕복, 빠른 단축 왕복, position + rotation 동시 움직임 실험
-4. saturation ratio와 RMSE, peak error, settling time 계산
-5. 결과 plot과 재현 절차 문서화
-
-## 10. 결론
-
-현재 MuJoCo 검증 단계에서는 OMY-L100 → FR3 position + orientation 6D Cartesian teleoperation의 기본 pipeline과 rotational DLS IK가 동작한다. `MAX_DQ = 0.004` baseline에서 기록된 한 로그는 position error 약 `7.78 mm`, orientation error 약 `10.02 deg`를 보였다. 다만 재클러치 anchor continuity와 빠른 동작 안정성은 추가 검증이 필요하므로, 실로봇 적용 준비가 완료되었다고 판단하지 않는다.
-
-## 2026-07-28 — Velocity IK and axis-separated teleoperation validation
-
-### 1. IK command changed to velocity-based control
-
-기존 joint command는 control cycle마다 정의된 increment를 누적했다.
-
-```python
-q_command_next = q_command_previous + dq
-```
-
-따라서 `dq`가 cycle 단위이면 실제 motion speed가 loop frequency에 의존한다.
-현재 controller는 joint velocity `qdot`을 `rad/s`로 계산하고, timestep을
-사용해 per-step increment를 만든다.
-
-```python
-qdot_command = np.clip(
-    qdot_raw,
-    -MAX_JOINT_SPEED,
-    MAX_JOINT_SPEED,
-)
-q_target = np.clip(
-    command_reference + qdot_command * dt,
-    joint_lower,
-    joint_upper,
-)
-```
-
-`MAX_JOINT_SPEED`로 joint velocity를 제한하며, target 1 kHz controller의
-command 해석과 measured `dt` 변화에 대한 일관성을 목표로 한다. 이 기록은
-simulation loop가 hard real-time 1 kHz를 달성했다고 주장하지 않는다.
-
-### 2. Position and orientation validation separated by mode
-
-Teleoperation은 다음 세 mode로 분리되었다.
-
-- `position_only`: position command를 갱신하고 orientation command는 hold
-- `orientation_only`: orientation command를 갱신하고 position command는 hold
-- `full_pose`: position과 orientation command를 모두 갱신
-
-Position과 orientation의 signed XYZ diagnostics도 별도로 추가했다.
-
-Position diagnostics:
-
-- OMY clutch-relative position x/y/z
-- mapped FR3 position increment x/y/z
-- FR3 command position x/y/z
-- FR3 target position x/y/z
-
-Orientation diagnostics:
-
-- OMY clutch-relative rotvec x/y/z
-- mapped FR3 rotation increment x/y/z
-- FR3 command rotvec x/y/z
-- FR3 target rotvec x/y/z
-
-검증 결과 position-only motion은 의도한 operator direction과 일치했다.
-Orientation-only input은 robot-frame 순서인 upward, downward, right, left로
-테스트했으며, 반대 방향 입력은 반대 mapped axis와 sign을 생성했다. FR3
-command와 target은 mapped value를 따라갔다.
-
-### 3. Scale changes
-
-정상 controller baseline의 `ORIENTATION_SCALE`은 `0.3`이다. Signed
-orientation-axis validation에서는 mapped rotation response를 시각적으로
-명확하게 보기 위해 `ORIENTATION_SCALE = 1.0`을 임시로 사용했다. 이 값은
-최종 teleoperation scale로 선택하지 않았으며, controller baseline은
-`ORIENTATION_SCALE = 0.3`으로 유지한다.
-
-`POSITION_SCALE`은 현재 `0.60`이며 오늘 diff에서 변경된 값으로 확인되지 않아
-이전 값은 기록하지 않는다.
-
-### 4. Current status
-
-- [x] velocity-based IK applied
-- [x] position and orientation test modes applied
-- [x] signed XYZ position diagnostics completed
-- [x] signed XYZ orientation diagnostics completed
-- [x] current position mapping accepted
-- [x] current orientation mapping accepted
-
-Joint posture behavior will be handled in a separate follow-up task.
-
-## 2026-07-30 — Optional null-space posture control
-
-`launch/FR3_omy_bridge.py`에 optional home-posture velocity objective를
-추가했다. `ENABLE_NULLSPACE_POSTURE = False`가 기본값이므로 기존 controller
-동작은 재현 가능하다. posture reference는 runtime FR3 home configuration인
-`q_home.copy()`를 사용한다.
-
-`position_only`에서 primary task는 position Jacobian의 DLS velocity이고,
-같은 DLS pseudoinverse로 null-space projector를 계산한다.
-
-```python
-qdot_task = J_pinv @ task_velocity
-qdot_posture_raw = NULLSPACE_GAIN * (q_posture_reference - q_current)
-qdot_null = (np.eye(7) - J_pinv @ J) @ qdot_posture_raw
-qdot_total = qdot_task + qdot_null
-qdot_command = np.clip(qdot_total, -MAX_JOINT_SPEED, MAX_JOINT_SPEED)
-q_target = command_reference + qdot_command * dt
-```
-
-`orientation_only`와 `full_pose`는 기존 IK 경로를 유지한다. `q_current`는
-실제 MuJoCo `data.qpos`에서 읽으며, `q_posture_reference`와 controlled FR3
-joint ordering을 확인한다.
-
-추가한 diagnostics는 `nullspace_enabled`, `nullspace_gain`,
-`qdot_task_norm`, `qdot_null_norm`, `qdot_total_norm`,
-`posture_reference_distance`, `null_task_leak`,
-`joint_speed_saturated`, `jacobian_condition`, 그리고
-`fr3_joint_1`부터 `fr3_joint_7`까지이다.
-
-실험 설정은 다음 세 조건으로 수동 실행한다.
+### 15.1 Joystick mode
 
 ```text
-1. ENABLE_NULLSPACE_POSTURE = False
-2. ENABLE_NULLSPACE_POSTURE = True, NULLSPACE_GAIN = 0.1
-3. ENABLE_NULLSPACE_POSTURE = True, NULLSPACE_GAIN = 0.3
+joystick input layer
+  → incremental Cartesian command source
+  → existing logical command
+  → target conditioner
+  → existing DLS stack
+
 ```
 
-수동 검증은 `position_only` stationary posture, 단일 forward movement,
-`Forward → Backward`, `Left → Right`, `Up → Down` return movement 순서로
-수행한다. 각 조건에서 position error RMSE/peak, posture-reference distance,
-`qdot_task_norm`, `qdot_null_norm`, `null_task_leak`, joint-speed saturation
-ratio, joint 3/4/5 trajectory를 비교한다.
+새 IK controller를 만드는 대신 command-generation front end를 추가하는
+구조로 확장한다.
 
-결정적 offline projector test는
-`tests/test_nullspace_posture.py`에 추가했다.
+### 15.2 Hardware assistance
 
-### Validation plots
+```text
+OMY physical leader
+  → passive gravity compensation
+  → same ROS joint-state / FK pipeline
 
-![Velocity-based DLS IK and conditioned target tracking result](images/teleop/development/20260728/velocity_ik_summary.png)
+```
 
-Velocity-based DLS IK and conditioned target tracking result.
+러버밴드나 스프링은 Cartesian mapping code와 분리된 physical layer로 다룬다.
 
-![Position-only signed-axis validation](images/teleop/development/20260728/signed_position_axes.png)
+### 15.3 Precision and haptic control
 
-Position-only signed-axis validation.
+```text
+FR3 contact/wrench state
+  → force filtering/scaling
+  → compliance or leader feedback path
 
-![Orientation-only signed-axis validation in robot-frame order](images/teleop/development/20260728/signed_orientation_axes.png)
+```
 
-Orientation-only signed-axis validation in robot-frame order: upward, downward,
-right, left. Visualization run with `ORIENTATION_SCALE = 1.0`.
+현재 unilateral kinematic pipeline 위에 contact-aware feedback/controller를
+추가하는 후속 단계다. 세 확장 기능의 상세 설계는 아직 구현하지 않는다.
+
+## 16. 관련 문서
+
+| Document | Responsibility |
+|---|---|
+| [README.md](../README.md) | 설치, 실행, 사용법, CSV/plot 확인 |
+| [position_mode_debugging.md](position_mode_debugging.md) | 주요 증상, 원인, 수정, 검증 제한 |
+| `joystick_mode_debugging.md` | joystick mode 후속 문서 예정 |
+| `hardware.md` | hardware, passive gravity compensation, safety 후속 문서 예정 |
+| `precision.md` | precision, contact, compliance, 정량 평가 후속 문서 예정 |
+| [archived development log](archive/development_log_20260723_20260730.md) | 날짜별 원본 개발 기록 |

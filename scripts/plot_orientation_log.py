@@ -31,6 +31,15 @@ def values_any(rows, *names):
     return np.zeros(len(rows))
 
 
+def rotvec_norm_deg(rows, prefix):
+    components = np.column_stack([
+        values(rows, f"{prefix}_x"),
+        values(rows, f"{prefix}_y"),
+        values(rows, f"{prefix}_z"),
+    ])
+    return np.rad2deg(np.linalg.norm(components, axis=1))
+
+
 def resolve_csv_path():
     if len(sys.argv) > 1:
         return Path(sys.argv[1]).expanduser().resolve()
@@ -219,11 +228,19 @@ def plot_target_acceleration(rows, time_s, csv_path):
             label="target acceleration norm",
         )
     else:
-        axes[1].plot(
-            time_s,
-            np.gradient(target_speed, time_s),
-            label="estimated target acceleration",
-        )
+        if "target_linear_acceleration_norm_mps2" in rows[0]:
+            axes[1].plot(
+                time_s,
+                values(rows, "target_linear_acceleration_norm_mps2"),
+                color="black",
+                label="target acceleration norm",
+            )
+        else:
+            axes[1].plot(
+                time_s,
+                np.gradient(target_speed, time_s),
+                label="estimated target acceleration",
+            )
     axes[1].axhline(
         linear_accel_limit,
         color="tab:red",
@@ -302,11 +319,19 @@ def plot_target_angular_dynamics(rows, time_s, csv_path):
             label="target angular acceleration norm",
         )
     else:
-        axes[1].plot(
-            time_s,
-            np.gradient(angular_speed, time_s),
-            label="estimated angular acceleration",
-        )
+        if "target_angular_acceleration_norm_radps2" in rows[0]:
+            axes[1].plot(
+                time_s,
+                values(rows, "target_angular_acceleration_norm_radps2"),
+                color="black",
+                label="target angular acceleration norm",
+            )
+        else:
+            axes[1].plot(
+                time_s,
+                np.gradient(angular_speed, time_s),
+                label="estimated angular acceleration",
+            )
     axes[1].axhline(
         2.0,
         color="tab:red",
@@ -356,27 +381,34 @@ def main():
     axes[0, 0].set_ylabel("Position error [mm]")
     axes[0, 0].grid(True)
 
-    axes[0, 1].plot(
-        time_s,
-        values_any(
-            rows,
-            "omy_relative_rotation_deg",
-            "omy_relative_angle_deg",
-        ),
-        label="OMY relative",
+    omy_rotation_names = (
+        "omy_relative_rotation_deg",
+        "omy_relative_angle_deg",
     )
+    if any(name in rows[0] for name in omy_rotation_names):
+        axes[0, 1].plot(
+            time_s,
+            values_any(rows, *omy_rotation_names),
+            label="OMY relative",
+        )
     axes[0, 1].plot(
         time_s,
-        values_any(rows, "fr3_command_cumulative_rotation_deg"),
+        values_any(rows, "fr3_command_cumulative_rotation_deg")
+        if "fr3_command_cumulative_rotation_deg" in rows[0]
+        else rotvec_norm_deg(rows, "fr3_command_rotvec"),
         label="FR3 command",
     )
     axes[0, 1].plot(
         time_s,
-        values_any(
-            rows,
-            "fr3_target_cumulative_rotation_deg",
-            "fr3_target_angle_deg",
-        ),
+        values_any(rows, "fr3_target_cumulative_rotation_deg", "fr3_target_angle_deg")
+        if any(
+            name in rows[0]
+            for name in (
+                "fr3_target_cumulative_rotation_deg",
+                "fr3_target_angle_deg",
+            )
+        )
+        else rotvec_norm_deg(rows, "fr3_target_rotvec"),
         label="FR3 target",
     )
     axes[0, 1].set_ylabel("Cumulative rotation [deg]")
@@ -429,8 +461,10 @@ def main():
     fig.savefig(png_path, dpi=160)
     print(f"saved: {png_path}")
 
-    plot_signed_position_diagnostics(rows, time_s, csv_path)
-    plot_signed_orientation_diagnostics(rows, time_s, csv_path)
+    if "omy_delta_position_x_m" in rows[0]:
+        plot_signed_position_diagnostics(rows, time_s, csv_path)
+    if "omy_delta_rotvec_x_rad" in rows[0]:
+        plot_signed_orientation_diagnostics(rows, time_s, csv_path)
     plot_target_acceleration(rows, time_s, csv_path)
     plot_target_angular_dynamics(rows, time_s, csv_path)
 

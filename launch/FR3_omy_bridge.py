@@ -35,6 +35,9 @@ FR3_MODEL_PATH = ROOT / "mujoco_menagerie" / "franka_fr3" / "scene.xml"
 
 ENABLE_VIEWER = True
 ENABLE_LOGGING = True
+ENABLE_MAPPING_DEBUG_LOGS = False
+ENABLE_OMY_INTERNAL_DEBUG_LOGS = False
+ENABLE_NULLSPACE_DEBUG_LOGS = False
 
 CONTROL_HZ = 1000.0
 CONTROL_DT = 1.0 / CONTROL_HZ
@@ -83,7 +86,7 @@ ORIENTATION_AXIS_MAP = np.array([
     [0.0, 0.0, -1.0],
 ])
 
-TELEOP_MODE = "orientation_only"
+TELEOP_MODE = "full_pose"
 SUPPORTED_TELEOP_MODES = {
     "position_only",
     "orientation_only",
@@ -91,17 +94,17 @@ SUPPORTED_TELEOP_MODES = {
 }
 
 # Conservative initial values.
-POSITION_SCALE = 0.30
+POSITION_SCALE = 0.4
 ORIENTATION_SCALE = 0.3
 
 # Cartesian target rate limits.
-MAX_TARGET_LINEAR_SPEED = 0.08       # m/s
+MAX_TARGET_LINEAR_SPEED = 0.09       # m/s
 MAX_TARGET_LINEAR_ACCEL = 2.0        # m/s^2
 POSITION_SNAP_ERROR = 1e-6           # m
 POSITION_SNAP_SPEED = 1e-3           # m/s
 MAX_TARGET_ANGULAR_SPEED = 2.0      # rad/s
 MAX_TARGET_ANGULAR_ACCEL = 4.0      # rad/s^2
-TARGET_ROTATION_KP = 6.0             # 1/s, target conditioning
+TARGET_ROTATION_KP = 4.0             # 1/s, target conditioning
 ROTATION_SNAP_ERROR = 1e-4           # rad
 
 # Task-space feedback used to generate a desired Cartesian twist.
@@ -113,7 +116,7 @@ IK_DAMPING = 0.05
 ROTATION_LENGTH_SCALE = 0.10         # m/rad task metric
 MAX_JOINT_SPEED = 0.80               # rad/s, simulation initial value
 ENABLE_NULLSPACE_POSTURE = True
-NULLSPACE_GAIN = 0.3
+NULLSPACE_GAIN = 0.1
 
 
 # ---------------------------------------------------------------------------
@@ -499,6 +502,27 @@ def dls_pseudoinverse(jacobian, damping):
     )
 
 
+def exact_nullspace_projector(jacobian):
+    """Return an SVD-based projector onto null(J)."""
+    _, singular_values, vh = np.linalg.svd(
+        jacobian,
+        full_matrices=True,
+    )
+    if singular_values.size == 0:
+        return np.eye(jacobian.shape[1])
+
+    tolerance = (
+        max(jacobian.shape)
+        * np.finfo(jacobian.dtype).eps
+        * singular_values[0]
+    )
+    rank = int(np.sum(singular_values > tolerance))
+    null_basis = vh[rank:].T
+    if null_basis.shape[1] == 0:
+        return np.zeros((jacobian.shape[1], jacobian.shape[1]))
+    return null_basis @ null_basis.T
+
+
 def compute_joint_target(
     model,
     data,
@@ -517,21 +541,15 @@ def compute_joint_target(
     enable_nullspace_posture=False,
     q_posture_reference=None,
 ):
-    """Compute q_target = q_current + qdot*dt with 6D DLS."""
+    """Compute a mode-specific velocity-DLS joint target."""
     current_position, current_rotation = read_site_pose(data, ee_site_id)
 
     position_error = target_position - current_position
     rotation_error_matrix = target_rotation @ current_rotation.T
     rotation_error = matrix_to_rotvec(rotation_error_matrix)
 
-    desired_linear_velocity = limit_norm(
-        POSITION_KP * position_error,
-        MAX_TARGET_LINEAR_SPEED,
-    )
-    desired_angular_velocity = limit_norm(
-        ORIENTATION_KP * rotation_error,
-        MAX_TARGET_ANGULAR_SPEED,
-    )
+    desired_linear_velocity = POSITION_KP * position_error
+    desired_angular_velocity = ORIENTATION_KP * rotation_error
 
     jacp.fill(0.0)
     jacr.fill(0.0)
@@ -545,12 +563,19 @@ def compute_joint_target(
 
     j_pos = jacp[:, dof_indices]
     j_rot = jacr[:, dof_indices]
+    if j_pos.shape != (3, 7) or j_rot.shape != (3, 7):
+        raise ValueError(
+            f"expected 3x7 position/rotation Jacobians, got "
+            f"{j_pos.shape} and {j_rot.shape}"
+        )
 
     if teleop_mode == "position_only":
         task_jacobian = j_pos
         task_velocity = desired_linear_velocity
-    else:
-        # ROTATION_LENGTH_SCALE converts angular velocity to a length metric.
+    elif teleop_mode == "orientation_only":
+        task_jacobian = ROTATION_LENGTH_SCALE * j_rot
+        task_velocity = ROTATION_LENGTH_SCALE * desired_angular_velocity
+    elif teleop_mode == "full_pose":
         task_jacobian = np.vstack((
             j_pos,
             ROTATION_LENGTH_SCALE * j_rot,
@@ -559,6 +584,18 @@ def compute_joint_target(
             desired_linear_velocity,
             ROTATION_LENGTH_SCALE * desired_angular_velocity,
         ))
+    else:
+        raise ValueError(f"Unsupported teleop mode: {teleop_mode}")
+
+    expected_task_rows = 3 if teleop_mode != "full_pose" else 6
+    if task_jacobian.shape != (expected_task_rows, 7):
+        raise ValueError(
+            f"unexpected task Jacobian shape: {task_jacobian.shape}"
+        )
+    if task_velocity.shape != (expected_task_rows,):
+        raise ValueError(
+            f"unexpected task velocity shape: {task_velocity.shape}"
+        )
 
     q_current = data.qpos[qpos_indices].copy()
     if q_current.shape != (7,):
@@ -570,47 +607,64 @@ def compute_joint_target(
             "Jacobian column count does not match controlled joint count"
         )
 
-    task_jacobian_pinv = dls_pseudoinverse(task_jacobian, IK_DAMPING)
-    qdot_task = task_jacobian_pinv @ task_velocity
-
-    nullspace_enabled = bool(
-        enable_nullspace_posture
-        and teleop_mode == "position_only"
-    )
-    if nullspace_enabled:
-        if q_posture_reference is None:
-            raise ValueError("q_posture_reference is required for null-space IK")
-        if q_posture_reference.shape != q_current.shape:
-            raise ValueError(
-                "q_posture_reference shape does not match q_current"
-            )
-        q_error_posture = q_posture_reference - q_current
-        qdot_posture_raw = NULLSPACE_GAIN * q_error_posture
-        null_projector = (
-            np.eye(q_current.shape[0])
-            - task_jacobian_pinv @ task_jacobian
-        )
-        qdot_null = null_projector @ qdot_posture_raw
-    else:
-        qdot_null = np.zeros_like(qdot_task)
-
-    qdot_total = qdot_task + qdot_null
     finite_values = {
-        "J": task_jacobian,
-        "J_pinv": task_jacobian_pinv,
-        "qdot_task": qdot_task,
-        "qdot_null": qdot_null,
-        "qdot_total": qdot_total,
+        "J_task": task_jacobian,
+        "task_twist": task_velocity,
     }
     nonfinite_names = [
         name for name, value in finite_values.items()
         if not np.all(np.isfinite(value))
     ]
+    task_jacobian_pinv = dls_pseudoinverse(task_jacobian, IK_DAMPING)
+    qdot_task = task_jacobian_pinv @ task_velocity
+    finite_values.update({
+        "J_dls": task_jacobian_pinv,
+        "qdot_task": qdot_task,
+    })
+    nonfinite_names.extend([
+        name for name, value in finite_values.items()
+        if name not in nonfinite_names and not np.all(np.isfinite(value))
+    ])
+    if nonfinite_names:
+        print(
+            "WARNING: non-finite 6D DLS values: "
+            + ", ".join(nonfinite_names)
+        )
+        qdot_task = np.zeros_like(q_current)
+
+    nullspace_enabled = bool(
+        enable_nullspace_posture
+        and q_posture_reference is not None
+    )
+    if nullspace_enabled:
+        if q_posture_reference.shape != q_current.shape:
+            raise ValueError(
+                "q_posture_reference shape does not match q_current"
+            )
+        null_projector = exact_nullspace_projector(task_jacobian)
+        qdot_posture = NULLSPACE_GAIN * (
+            q_posture_reference - q_current
+        )
+        qdot_null = null_projector @ qdot_posture
+    else:
+        qdot_null = np.zeros_like(qdot_task)
+
+    qdot_total = qdot_task + qdot_null
+    finite_values.update({
+        "qdot_null": qdot_null,
+        "qdot_total": qdot_total,
+    })
+    nonfinite_names.extend([
+        name for name, value in finite_values.items()
+        if name not in nonfinite_names and not np.all(np.isfinite(value))
+    ])
     if nonfinite_names:
         print(
             "WARNING: non-finite null-space IK values: "
             + ", ".join(nonfinite_names)
         )
+        qdot_task = np.zeros_like(q_current)
+        qdot_null = np.zeros_like(q_current)
         qdot_total = np.zeros_like(q_current)
 
     qdot_command = np.clip(
@@ -637,31 +691,42 @@ def compute_joint_target(
     except np.linalg.LinAlgError:
         condition_number = float("inf")
 
-    null_task_leak = float(np.linalg.norm(task_jacobian @ qdot_null))
-    posture_reference_distance = float(
-        np.linalg.norm(
-            q_posture_reference - q_current
-        )
-    ) if q_posture_reference is not None else 0.0
+    task_residual = task_jacobian @ qdot_task - task_velocity
 
     diagnostics = {
+        "teleop_mode": teleop_mode,
         "position_error_m": float(np.linalg.norm(position_error)),
+        "position_error_norm": float(np.linalg.norm(position_error)),
         "orientation_error_deg": float(
             np.degrees(np.linalg.norm(rotation_error))
         ),
+        "orientation_error_norm_rad": float(np.linalg.norm(rotation_error)),
+        "linear_task_velocity_norm": float(
+            np.linalg.norm(desired_linear_velocity)
+        ),
+        "angular_task_velocity_norm": float(
+            np.linalg.norm(desired_angular_velocity)
+        ),
+        "weighted_task_twist_norm": float(np.linalg.norm(task_velocity)),
         "raw_max_qdot": float(np.max(np.abs(qdot_total))),
         "cmd_max_qdot": float(np.max(np.abs(qdot_command))),
         "qdot_saturated": saturated,
         "jacobian_condition": condition_number,
         "nullspace_enabled": nullspace_enabled,
-        "nullspace_gain": NULLSPACE_GAIN,
+        "nullspace_gain": NULLSPACE_GAIN if nullspace_enabled else 0.0,
         "qdot_task_norm": float(np.linalg.norm(qdot_task)),
         "qdot_null_norm": float(np.linalg.norm(qdot_null)),
         "qdot_total_norm": float(np.linalg.norm(qdot_total)),
-        "posture_reference_distance": posture_reference_distance,
-        "null_task_leak": null_task_leak,
+        "task_residual_norm": float(np.linalg.norm(task_residual)),
+        "posture_reference_distance": float(
+            np.linalg.norm(q_posture_reference - q_current)
+        ) if q_posture_reference is not None else 0.0,
+        "null_task_leak": float(np.linalg.norm(task_jacobian @ qdot_null)),
         "joint_speed_saturated": saturated,
         "joint_positions": q_current.copy(),
+        "qdot_task": qdot_task.copy(),
+        "qdot_null": qdot_null.copy(),
+        "qdot_total": qdot_total.copy(),
         "max_q_command_error": float(
             np.max(np.abs(q_target - q_current))
         ),
@@ -840,6 +905,7 @@ def main():
     target_desired_linear_speed = 0.0
     target_snapped_to_command = False
     target_angular_acceleration = np.zeros(3)
+    nullspace_posture_reference = q_home.copy()
     omy_anchor_position = None
     omy_anchor_rotation = None
     omy_anchor_base_ee_transform = None
@@ -960,21 +1026,27 @@ def main():
                         f"held command angle={held_command_angle_deg:.2f} deg"
                     )
 
-                if teleop_active and omy_anchor_base_ee_transform is not None:
-                    omy_raw_clutch_position_delta = (
-                        omy_current_position - omy_anchor_position
+                if (
+                    teleop_active
+                    and omy_anchor_base_ee_transform is not None
+                    and (
+                        ENABLE_MAPPING_DEBUG_LOGS
+                        or ENABLE_OMY_INTERNAL_DEBUG_LOGS
                     )
-                    omy_delta_rotvec = matrix_to_rotvec(
-                        omy_anchor_rotation.T @ omy_current_rotation
-                    )
-                    omy_clutch_base_position_delta = (
-                        omy_base_ee_transform[:3, 3]
-                        - omy_anchor_base_ee_transform[:3, 3]
-                    )
-                    omy_clutch_spatial_rotation_vector = matrix_to_rotvec(
-                        omy_base_ee_transform[:3, :3]
-                        @ omy_anchor_base_ee_transform[:3, :3].T
-                    )
+                ):
+                    if ENABLE_MAPPING_DEBUG_LOGS:
+                        omy_raw_clutch_position_delta = (
+                            omy_current_position - omy_anchor_position
+                        )
+                    if ENABLE_OMY_INTERNAL_DEBUG_LOGS:
+                        omy_clutch_base_position_delta = (
+                            omy_base_ee_transform[:3, 3]
+                            - omy_anchor_base_ee_transform[:3, 3]
+                        )
+                        omy_clutch_spatial_rotation_vector = matrix_to_rotvec(
+                            omy_base_ee_transform[:3, :3]
+                            @ omy_anchor_base_ee_transform[:3, :3].T
+                        )
 
                 if teleop_active:
                     (
@@ -1051,27 +1123,14 @@ def main():
                 fr3_command_rotation = fr3_target_rotation.copy()
                 target_follow_active = False
 
-            if omy_anchor_rotation is None or not ros_fresh or not teleop_active:
-                omy_relative_rotation_deg = 0.0
-            else:
-                omy_relative_rotation_deg = float(np.rad2deg(
-                    np.linalg.norm(omy_delta_rotvec)
-                ))
-                fr3_mapped_rotation_delta = matrix_to_rotvec(
-                    fr3_anchor_rotation.T @ fr3_command_rotation
-                )
-            fr3_command_cumulative_rotation_deg = rotation_distance_deg(
-                fr3_initial_command_rotation,
-                fr3_command_rotation,
-            )
-            fr3_target_cumulative_rotation_deg = rotation_distance_deg(
-                fr3_initial_command_rotation,
-                fr3_target_rotation,
-            )
             command_target_rotation_gap_deg = rotation_distance_deg(
                 fr3_target_rotation,
                 fr3_command_rotation,
             )
+            if ENABLE_MAPPING_DEBUG_LOGS and omy_anchor_rotation is not None:
+                fr3_mapped_rotation_delta = matrix_to_rotvec(
+                    fr3_anchor_rotation.T @ fr3_command_rotation
+                )
 
             if target_follow_active:
                 q_target, diagnostics = compute_joint_target(
@@ -1090,7 +1149,7 @@ def main():
                     CONTROL_DT,
                     teleop_mode=TELEOP_MODE,
                     enable_nullspace_posture=ENABLE_NULLSPACE_POSTURE,
-                    q_posture_reference=q_home,
+                    q_posture_reference=nullspace_posture_reference,
                 )
                 hold_q_target = q_target.copy()
             else:
@@ -1100,7 +1159,13 @@ def main():
                 q_target = hold_q_target.copy()
                 diagnostics = {
                     "position_error_m": 0.0,
+                    "teleop_mode": TELEOP_MODE,
+                    "position_error_norm": 0.0,
                     "orientation_error_deg": 0.0,
+                    "orientation_error_norm_rad": 0.0,
+                    "linear_task_velocity_norm": 0.0,
+                    "angular_task_velocity_norm": 0.0,
+                    "weighted_task_twist_norm": 0.0,
                     "raw_max_qdot": 0.0,
                     "cmd_max_qdot": 0.0,
                     "qdot_saturated": False,
@@ -1116,10 +1181,14 @@ def main():
                         )
                     ),
                     "null_task_leak": 0.0,
+                    "task_residual_norm": 0.0,
                     "joint_speed_saturated": False,
                     "joint_positions": fr3_data.qpos[
                         fr3_qpos_indices
                     ].copy(),
+                    "qdot_task": np.zeros(7),
+                    "qdot_null": np.zeros(7),
+                    "qdot_total": np.zeros(7),
                     "max_q_command_error": float(
                         np.max(np.abs(q_target - fr3_data.qpos[fr3_qpos_indices]))
                     ),
@@ -1141,7 +1210,7 @@ def main():
                 fr3_actual_rotation @ fr3_initial_command_rotation.T
             )
 
-            if omy_anchor_position is not None:
+            if ENABLE_MAPPING_DEBUG_LOGS and omy_anchor_position is not None:
                 fr3_command_position_delta = (
                     fr3_command_position - fr3_anchor_position
                 )
@@ -1173,42 +1242,12 @@ def main():
                 ENABLE_LOGGING
                 and step_index % max(1, int(CONTROL_HZ / LOG_HZ)) == 0
             ):
-                rows.append({
+                log_row = {
                     "wall_time": now,
                     "sim_time": float(fr3_data.time),
                     "teleop_active": int(teleop_active),
                     "ros_fresh": int(ros_fresh),
                     "clutch_id": clutch_id,
-                    "omy_raw_clutch_position_dx": (
-                        omy_raw_clutch_position_delta[0]
-                    ),
-                    "omy_raw_clutch_position_dy": (
-                        omy_raw_clutch_position_delta[1]
-                    ),
-                    "omy_raw_clutch_position_dz": (
-                        omy_raw_clutch_position_delta[2]
-                    ),
-                    "omy_delta_position_x_m": omy_raw_clutch_position_delta[0],
-                    "omy_delta_position_y_m": omy_raw_clutch_position_delta[1],
-                    "omy_delta_position_z_m": omy_raw_clutch_position_delta[2],
-                    "omy_delta_rotvec_x_rad": omy_delta_rotvec[0],
-                    "omy_delta_rotvec_y_rad": omy_delta_rotvec[1],
-                    "omy_delta_rotvec_z_rad": omy_delta_rotvec[2],
-                    "fr3_command_position_dx": fr3_command_position_delta[0],
-                    "fr3_command_position_dy": fr3_command_position_delta[1],
-                    "fr3_command_position_dz": fr3_command_position_delta[2],
-                    "fr3_target_position_dx": fr3_target_position_delta[0],
-                    "fr3_target_position_dy": fr3_target_position_delta[1],
-                    "fr3_target_position_dz": fr3_target_position_delta[2],
-                    "fr3_actual_position_dx": fr3_actual_position_delta[0],
-                    "fr3_actual_position_dy": fr3_actual_position_delta[1],
-                    "fr3_actual_position_dz": fr3_actual_position_delta[2],
-                    "mapped_position_delta_x_m": fr3_command_position_delta[0],
-                    "mapped_position_delta_y_m": fr3_command_position_delta[1],
-                    "mapped_position_delta_z_m": fr3_command_position_delta[2],
-                    "mapped_rotation_delta_x_rad": fr3_mapped_rotation_delta[0],
-                    "mapped_rotation_delta_y_rad": fr3_mapped_rotation_delta[1],
-                    "mapped_rotation_delta_z_rad": fr3_mapped_rotation_delta[2],
                     "fr3_command_position_x": fr3_command_position[0],
                     "fr3_command_position_y": fr3_command_position[1],
                     "fr3_command_position_z": fr3_command_position[2],
@@ -1227,120 +1266,42 @@ def main():
                     "fr3_actual_rotvec_x": fr3_actual_session_rotvec[0],
                     "fr3_actual_rotvec_y": fr3_actual_session_rotvec[1],
                     "fr3_actual_rotvec_z": fr3_actual_session_rotvec[2],
-                    "omy_base_ee_position_x": omy_base_ee_position[0],
-                    "omy_base_ee_position_y": omy_base_ee_position[1],
-                    "omy_base_ee_position_z": omy_base_ee_position[2],
-                    "omy_base_ee_rotvec_x": omy_base_ee_rotation_vector[0],
-                    "omy_base_ee_rotvec_y": omy_base_ee_rotation_vector[1],
-                    "omy_base_ee_rotvec_z": omy_base_ee_rotation_vector[2],
-                    "omy_clutch_base_delta_x": (
-                        omy_clutch_base_position_delta[0]
-                    ),
-                    "omy_clutch_base_delta_y": (
-                        omy_clutch_base_position_delta[1]
-                    ),
-                    "omy_clutch_base_delta_z": (
-                        omy_clutch_base_position_delta[2]
-                    ),
-                    "omy_clutch_spatial_rotvec_x": (
-                        omy_clutch_spatial_rotation_vector[0]
-                    ),
-                    "omy_clutch_spatial_rotvec_y": (
-                        omy_clutch_spatial_rotation_vector[1]
-                    ),
-                    "omy_clutch_spatial_rotvec_z": (
-                        omy_clutch_spatial_rotation_vector[2]
-                    ),
-                    "omy_relative_rotation_deg": omy_relative_rotation_deg,
-                    "fr3_command_cumulative_rotation_deg": (
-                        fr3_command_cumulative_rotation_deg
-                    ),
-                    "fr3_target_cumulative_rotation_deg": (
-                        fr3_target_cumulative_rotation_deg
-                    ),
                     "command_target_rotation_gap_deg": (
                         command_target_rotation_gap_deg
                     ),
-                    "position_error_mm": 1000.0 * diagnostics["position_error_m"],
-                    "position_error": diagnostics["position_error_m"],
-                    "orientation_error_deg": diagnostics["orientation_error_deg"],
+                    "teleop_mode": diagnostics["teleop_mode"],
+                    "position_error_norm": diagnostics["position_error_norm"],
+                    "orientation_error_norm_rad": diagnostics[
+                        "orientation_error_norm_rad"
+                    ],
+                    "linear_task_velocity_norm": diagnostics[
+                        "linear_task_velocity_norm"
+                    ],
+                    "angular_task_velocity_norm": diagnostics[
+                        "angular_task_velocity_norm"
+                    ],
+                    "weighted_task_twist_norm": diagnostics[
+                        "weighted_task_twist_norm"
+                    ],
                     "target_linear_speed_mps": target_linear_speed,
-                    "target_linear_speed": target_linear_speed,
-                    "target_linear_acceleration_x_mps2": (
-                        target_linear_acceleration[0]
-                    ),
-                    "target_linear_acceleration_y_mps2": (
-                        target_linear_acceleration[1]
-                    ),
-                    "target_linear_acceleration_z_mps2": (
-                        target_linear_acceleration[2]
-                    ),
                     "target_linear_acceleration_norm_mps2": float(
                         np.linalg.norm(target_linear_acceleration)
                     ),
-                    "target_linear_acceleration_x": (
-                        target_linear_acceleration[0]
-                    ),
-                    "target_linear_acceleration_y": (
-                        target_linear_acceleration[1]
-                    ),
-                    "target_linear_acceleration_z": (
-                        target_linear_acceleration[2]
-                    ),
-                    "target_linear_acceleration_norm": float(
-                        np.linalg.norm(target_linear_acceleration)
-                    ),
-                    "stopping_speed": target_stopping_speed,
-                    "desired_linear_speed": target_desired_linear_speed,
-                    "snapped_to_command": int(target_snapped_to_command),
                     "control_dt": CONTROL_DT,
                     "target_angular_speed_radps": target_angular_speed,
-                    "target_angular_speed": target_angular_speed,
-                    "target_angular_acceleration_x_radps2": (
-                        target_angular_acceleration[0]
-                    ),
-                    "target_angular_acceleration_y_radps2": (
-                        target_angular_acceleration[1]
-                    ),
-                    "target_angular_acceleration_z_radps2": (
-                        target_angular_acceleration[2]
-                    ),
                     "target_angular_acceleration_norm_radps2": float(
-                        np.linalg.norm(target_angular_acceleration)
-                    ),
-                    "target_angular_acceleration_x": (
-                        target_angular_acceleration[0]
-                    ),
-                    "target_angular_acceleration_y": (
-                        target_angular_acceleration[1]
-                    ),
-                    "target_angular_acceleration_z": (
-                        target_angular_acceleration[2]
-                    ),
-                    "target_angular_acceleration_norm": float(
                         np.linalg.norm(target_angular_acceleration)
                     ),
                     "raw_max_qdot_radps": diagnostics["raw_max_qdot"],
                     "cmd_max_qdot_radps": diagnostics["cmd_max_qdot"],
-                    "qdot_saturated": int(diagnostics["qdot_saturated"]),
-                    "nullspace_enabled": int(
-                        diagnostics["nullspace_enabled"]
-                    ),
-                    "nullspace_gain": diagnostics["nullspace_gain"],
                     "qdot_task_norm": diagnostics["qdot_task_norm"],
-                    "qdot_null_norm": diagnostics["qdot_null_norm"],
-                    "qdot_total_norm": diagnostics["qdot_total_norm"],
-                    "posture_reference_distance": diagnostics[
-                        "posture_reference_distance"
+                    "task_residual_norm": diagnostics[
+                        "task_residual_norm"
                     ],
-                    "null_task_leak": diagnostics["null_task_leak"],
                     "joint_speed_saturated": int(
                         diagnostics["joint_speed_saturated"]
                     ),
                     "jacobian_condition": diagnostics["jacobian_condition"],
-                    "max_q_command_error_rad": diagnostics[
-                        "max_q_command_error"
-                    ],
                     "deadline_misses": deadline_misses,
                     "fr3_joint_1": diagnostics["joint_positions"][0],
                     "fr3_joint_2": diagnostics["joint_positions"][1],
@@ -1349,38 +1310,95 @@ def main():
                     "fr3_joint_5": diagnostics["joint_positions"][4],
                     "fr3_joint_6": diagnostics["joint_positions"][5],
                     "fr3_joint_7": diagnostics["joint_positions"][6],
-                })
+                }
+
+                if ENABLE_MAPPING_DEBUG_LOGS:
+                    log_row.update({
+                        "omy_delta_position_x_m": (
+                            omy_raw_clutch_position_delta[0]
+                        ),
+                        "omy_delta_position_y_m": (
+                            omy_raw_clutch_position_delta[1]
+                        ),
+                        "omy_delta_position_z_m": (
+                            omy_raw_clutch_position_delta[2]
+                        ),
+                        "omy_delta_rotvec_x_rad": omy_delta_rotvec[0],
+                        "omy_delta_rotvec_y_rad": omy_delta_rotvec[1],
+                        "omy_delta_rotvec_z_rad": omy_delta_rotvec[2],
+                        "mapped_position_delta_x_m": (
+                            fr3_command_position_delta[0]
+                        ),
+                        "mapped_position_delta_y_m": (
+                            fr3_command_position_delta[1]
+                        ),
+                        "mapped_position_delta_z_m": (
+                            fr3_command_position_delta[2]
+                        ),
+                        "mapped_rotation_delta_x_rad": (
+                            fr3_mapped_rotation_delta[0]
+                        ),
+                        "mapped_rotation_delta_y_rad": (
+                            fr3_mapped_rotation_delta[1]
+                        ),
+                        "mapped_rotation_delta_z_rad": (
+                            fr3_mapped_rotation_delta[2]
+                        ),
+                    })
+
+                if ENABLE_OMY_INTERNAL_DEBUG_LOGS:
+                    log_row.update({
+                        "omy_base_ee_position_x": omy_base_ee_position[0],
+                        "omy_base_ee_position_y": omy_base_ee_position[1],
+                        "omy_base_ee_position_z": omy_base_ee_position[2],
+                        "omy_base_ee_rotvec_x": (
+                            omy_base_ee_rotation_vector[0]
+                        ),
+                        "omy_base_ee_rotvec_y": (
+                            omy_base_ee_rotation_vector[1]
+                        ),
+                        "omy_base_ee_rotvec_z": (
+                            omy_base_ee_rotation_vector[2]
+                        ),
+                        "omy_clutch_base_delta_x": (
+                            omy_clutch_base_position_delta[0]
+                        ),
+                        "omy_clutch_base_delta_y": (
+                            omy_clutch_base_position_delta[1]
+                        ),
+                        "omy_clutch_base_delta_z": (
+                            omy_clutch_base_position_delta[2]
+                        ),
+                        "omy_clutch_spatial_rotvec_x": (
+                            omy_clutch_spatial_rotation_vector[0]
+                        ),
+                        "omy_clutch_spatial_rotvec_y": (
+                            omy_clutch_spatial_rotation_vector[1]
+                        ),
+                        "omy_clutch_spatial_rotvec_z": (
+                            omy_clutch_spatial_rotation_vector[2]
+                        ),
+                    })
+
+                rows.append(log_row)
 
             if now - last_print >= 1.0 / PRINT_HZ:
-                print(
-                    f"mode={TELEOP_MODE} | "
-                    f"OMY dp={omy_raw_clutch_position_delta} | "
-                    f"mapped dp={fr3_command_position_delta} | "
-                    f"OMY dr={omy_delta_rotvec} | "
-                    f"mapped dr={fr3_mapped_rotation_delta}"
-                )
+                if ENABLE_MAPPING_DEBUG_LOGS:
+                    print(
+                        f"OMY dp={omy_raw_clutch_position_delta} | "
+                        f"mapped dp={fr3_command_position_delta} | "
+                        f"OMY dr={omy_delta_rotvec} | "
+                        f"mapped dr={fr3_mapped_rotation_delta}"
+                    )
                 print(
                     f"pos={1000.0 * diagnostics['position_error_m']:.2f} mm | "
                     f"rot={diagnostics['orientation_error_deg']:.2f} deg | "
-                    f"clutch={clutch_id} | "
-                    f"omy_rel={omy_relative_rotation_deg:.2f} deg | "
-                    f"cmd={fr3_command_cumulative_rotation_deg:.2f} deg | "
-                    f"target={fr3_target_cumulative_rotation_deg:.2f} deg | "
-                    f"gap={command_target_rotation_gap_deg:.2f} deg | "
+                    f"mode={TELEOP_MODE} | "
                     f"qdot={diagnostics['cmd_max_qdot']:.3f} rad/s | "
-                    f"cond={diagnostics['jacobian_condition']:.1f}"
+                    f"cond={diagnostics['jacobian_condition']:.1f} | "
+                    f"task_res={diagnostics['task_residual_norm']:.4f} | "
+                    f"sat={diagnostics['joint_speed_saturated']}"
                 )
-                if diagnostics["nullspace_enabled"]:
-                    print(
-                        "[Nullspace] "
-                        f"gain={diagnostics['nullspace_gain']:.3f} | "
-                        f"posture_dist="
-                        f"{diagnostics['posture_reference_distance']:.4f} | "
-                        f"qdot_task_norm={diagnostics['qdot_task_norm']:.4f} | "
-                        f"qdot_null_norm={diagnostics['qdot_null_norm']:.4f} | "
-                        f"null_task_leak={diagnostics['null_task_leak']:.4e} | "
-                        f"saturated={diagnostics['joint_speed_saturated']}"
-                    )
                 last_print = now
 
             if now - last_rate_report >= 1.0:
