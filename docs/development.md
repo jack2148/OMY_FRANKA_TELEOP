@@ -728,6 +728,52 @@ orientation-axis validation에서는 mapped rotation response를 시각적으로
 
 Joint posture behavior will be handled in a separate follow-up task.
 
+## 2026-07-30 — Optional null-space posture control
+
+`launch/FR3_omy_bridge.py`에 optional home-posture velocity objective를
+추가했다. `ENABLE_NULLSPACE_POSTURE = False`가 기본값이므로 기존 controller
+동작은 재현 가능하다. posture reference는 runtime FR3 home configuration인
+`q_home.copy()`를 사용한다.
+
+`position_only`에서 primary task는 position Jacobian의 DLS velocity이고,
+같은 DLS pseudoinverse로 null-space projector를 계산한다.
+
+```python
+qdot_task = J_pinv @ task_velocity
+qdot_posture_raw = NULLSPACE_GAIN * (q_posture_reference - q_current)
+qdot_null = (np.eye(7) - J_pinv @ J) @ qdot_posture_raw
+qdot_total = qdot_task + qdot_null
+qdot_command = np.clip(qdot_total, -MAX_JOINT_SPEED, MAX_JOINT_SPEED)
+q_target = command_reference + qdot_command * dt
+```
+
+`orientation_only`와 `full_pose`는 기존 IK 경로를 유지한다. `q_current`는
+실제 MuJoCo `data.qpos`에서 읽으며, `q_posture_reference`와 controlled FR3
+joint ordering을 확인한다.
+
+추가한 diagnostics는 `nullspace_enabled`, `nullspace_gain`,
+`qdot_task_norm`, `qdot_null_norm`, `qdot_total_norm`,
+`posture_reference_distance`, `null_task_leak`,
+`joint_speed_saturated`, `jacobian_condition`, 그리고
+`fr3_joint_1`부터 `fr3_joint_7`까지이다.
+
+실험 설정은 다음 세 조건으로 수동 실행한다.
+
+```text
+1. ENABLE_NULLSPACE_POSTURE = False
+2. ENABLE_NULLSPACE_POSTURE = True, NULLSPACE_GAIN = 0.1
+3. ENABLE_NULLSPACE_POSTURE = True, NULLSPACE_GAIN = 0.3
+```
+
+수동 검증은 `position_only` stationary posture, 단일 forward movement,
+`Forward → Backward`, `Left → Right`, `Up → Down` return movement 순서로
+수행한다. 각 조건에서 position error RMSE/peak, posture-reference distance,
+`qdot_task_norm`, `qdot_null_norm`, `null_task_leak`, joint-speed saturation
+ratio, joint 3/4/5 trajectory를 비교한다.
+
+결정적 offline projector test는
+`tests/test_nullspace_posture.py`에 추가했다.
+
 ### Validation plots
 
 ![Velocity-based DLS IK and conditioned target tracking result](images/teleop/development/20260728/velocity_ik_summary.png)

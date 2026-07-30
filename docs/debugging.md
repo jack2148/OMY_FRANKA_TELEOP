@@ -734,6 +734,27 @@ teleoperation scale이 아니다. The signed orientation-axis plot must be
 interpreted as an axis/sign validation result, not as a performance result for
 the final scale.
 
+## 2026-07-30 — Optional null-space posture control
+
+### Symptom
+
+FR3 EE position tracking is correct, but shoulder/elbow posture swivels unnaturally.
+
+### Hypothesis
+
+The position-only task leaves multiple redundant joint-space directions uncontrolled.
+
+### Modification
+
+Add a home-posture velocity objective projected through the DLS null-space projector.
+
+### Comparison
+
+Null-space OFF / gain 0.1 / gain 0.3.
+
+### Decision
+
+
 ### Final debugging status
 
 - velocity IK conversion: completed

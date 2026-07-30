@@ -83,7 +83,7 @@ ORIENTATION_AXIS_MAP = np.array([
     [0.0, 0.0, -1.0],
 ])
 
-TELEOP_MODE = "orientation_only"
+TELEOP_MODE = "position_only"
 SUPPORTED_TELEOP_MODES = {
     "position_only",
     "orientation_only",
@@ -91,11 +91,14 @@ SUPPORTED_TELEOP_MODES = {
 }
 
 # Conservative initial values.
-POSITION_SCALE = 0.60
-ORIENTATION_SCALE = 1.0
+POSITION_SCALE = 0.30
+ORIENTATION_SCALE = 0.3
 
 # Cartesian target rate limits.
-MAX_TARGET_LINEAR_SPEED = 0.10       # m/s
+MAX_TARGET_LINEAR_SPEED = 0.08       # m/s
+MAX_TARGET_LINEAR_ACCEL = 2.0        # m/s^2
+POSITION_SNAP_ERROR = 1e-6           # m
+POSITION_SNAP_SPEED = 1e-3           # m/s
 MAX_TARGET_ANGULAR_SPEED = 2.0      # rad/s
 MAX_TARGET_ANGULAR_ACCEL = 2.0      # rad/s^2
 TARGET_ROTATION_KP = 4.0             # 1/s, target conditioning
@@ -109,6 +112,8 @@ ORIENTATION_KP = 4.0                 # 1/s
 IK_DAMPING = 0.05
 ROTATION_LENGTH_SCALE = 0.10         # m/rad task metric
 MAX_JOINT_SPEED = 0.80               # rad/s, simulation initial value
+ENABLE_NULLSPACE_POSTURE = True
+NULLSPACE_GAIN = 0.3
 
 
 # ---------------------------------------------------------------------------
@@ -364,16 +369,64 @@ def condition_target(
     current_target_rotation,
     desired_position,
     desired_rotation,
+    previous_linear_velocity,
     previous_angular_velocity,
     dt,
 ):
     """Rate- and acceleration-limit the Cartesian target."""
-    position_step = desired_position - current_target_position
-    position_step = limit_norm(
-        position_step,
-        MAX_TARGET_LINEAR_SPEED * dt,
+    position_error = desired_position - current_target_position
+    error_norm = float(np.linalg.norm(position_error))
+    if error_norm > 1e-12:
+        position_direction = position_error / error_norm
+        proportional_speed = POSITION_KP * error_norm
+        linear_stopping_speed = np.sqrt(
+            max(
+                0.0,
+                2.0 * MAX_TARGET_LINEAR_ACCEL * error_norm,
+            )
+        )
+        desired_linear_speed = min(
+            proportional_speed,
+            MAX_TARGET_LINEAR_SPEED,
+            linear_stopping_speed,
+        )
+        desired_linear_velocity = (
+            position_direction * desired_linear_speed
+        )
+    else:
+        linear_stopping_speed = 0.0
+        desired_linear_speed = 0.0
+        desired_linear_velocity = np.zeros(3)
+
+    delta_linear_velocity = (
+        desired_linear_velocity - previous_linear_velocity
     )
+    limited_delta_linear_velocity = limit_norm(
+        delta_linear_velocity,
+        MAX_TARGET_LINEAR_ACCEL * dt,
+    )
+    linear_velocity = previous_linear_velocity + limited_delta_linear_velocity
+    position_step = linear_velocity * dt
     next_position = current_target_position + position_step
+    snapped_to_command = False
+
+    new_error_norm = float(np.linalg.norm(desired_position - next_position))
+    can_snap = (
+        new_error_norm < POSITION_SNAP_ERROR
+        and np.linalg.norm(previous_linear_velocity) < POSITION_SNAP_SPEED
+        and np.linalg.norm(linear_velocity) < POSITION_SNAP_SPEED
+        and np.linalg.norm(previous_linear_velocity)
+        <= MAX_TARGET_LINEAR_ACCEL * dt
+    )
+    if can_snap:
+        limited_delta_linear_velocity = -previous_linear_velocity
+        linear_velocity = np.zeros(3)
+        next_position = desired_position.copy()
+        snapped_to_command = True
+
+    commanded_linear_acceleration = (
+        limited_delta_linear_velocity / max(dt, 1e-9)
+    )
 
     target_rotation_error = desired_rotation @ current_target_rotation.T
     rotation_error = matrix_to_rotvec(target_rotation_error)
@@ -384,13 +437,13 @@ def condition_target(
         angular_velocity = np.zeros(3)
     else:
         direction = rotation_error / error_angle
-        stopping_speed = np.sqrt(
+        angular_stopping_speed = np.sqrt(
             2.0 * MAX_TARGET_ANGULAR_ACCEL * error_angle
         )
         desired_speed = min(
             TARGET_ROTATION_KP * error_angle,
             MAX_TARGET_ANGULAR_SPEED,
-            stopping_speed,
+            angular_stopping_speed,
         )
         desired_angular_velocity = direction * desired_speed
         delta_angular_velocity = (
@@ -409,12 +462,35 @@ def condition_target(
 
     linear_speed = float(np.linalg.norm(position_step) / max(dt, 1e-9))
     angular_speed = float(np.linalg.norm(angular_velocity))
-    return next_position, next_rotation, linear_speed, angular_speed, angular_velocity
+    return (
+        next_position,
+        next_rotation,
+        linear_speed,
+        angular_speed,
+        commanded_linear_acceleration,
+        linear_velocity,
+        angular_velocity,
+        linear_stopping_speed,
+        desired_linear_speed,
+        snapped_to_command,
+    )
 
 
 # ---------------------------------------------------------------------------
 # 6D DLS velocity IK
 # ---------------------------------------------------------------------------
+
+def dls_pseudoinverse(jacobian, damping):
+    task_dim = jacobian.shape[0]
+    regularized = (
+        jacobian @ jacobian.T
+        + damping**2 * np.eye(task_dim)
+    )
+    return jacobian.T @ np.linalg.solve(
+        regularized,
+        np.eye(task_dim),
+    )
+
 
 def compute_joint_target(
     model,
@@ -430,6 +506,9 @@ def compute_joint_target(
     jacp,
     jacr,
     dt,
+    teleop_mode="full_pose",
+    enable_nullspace_posture=False,
+    q_posture_reference=None,
 ):
     """Compute q_target = q_current + qdot*dt with 6D DLS."""
     current_position, current_rotation = read_site_pose(data, ee_site_id)
@@ -460,33 +539,82 @@ def compute_joint_target(
     j_pos = jacp[:, dof_indices]
     j_rot = jacr[:, dof_indices]
 
-    # ROTATION_LENGTH_SCALE converts angular velocity to a length metric.
-    task_jacobian = np.vstack((
-        j_pos,
-        ROTATION_LENGTH_SCALE * j_rot,
-    ))
-    task_velocity = np.concatenate((
-        desired_linear_velocity,
-        ROTATION_LENGTH_SCALE * desired_angular_velocity,
-    ))
+    if teleop_mode == "position_only":
+        task_jacobian = j_pos
+        task_velocity = desired_linear_velocity
+    else:
+        # ROTATION_LENGTH_SCALE converts angular velocity to a length metric.
+        task_jacobian = np.vstack((
+            j_pos,
+            ROTATION_LENGTH_SCALE * j_rot,
+        ))
+        task_velocity = np.concatenate((
+            desired_linear_velocity,
+            ROTATION_LENGTH_SCALE * desired_angular_velocity,
+        ))
 
-    regularized = (
-        task_jacobian @ task_jacobian.T
-        + (IK_DAMPING ** 2) * np.eye(6)
+    q_current = data.qpos[qpos_indices].copy()
+    if q_current.shape != (7,):
+        raise ValueError(
+            f"expected 7 controlled FR3 joints, got {q_current.shape}"
+        )
+    if task_jacobian.shape[1] != q_current.shape[0]:
+        raise ValueError(
+            "Jacobian column count does not match controlled joint count"
+        )
+
+    task_jacobian_pinv = dls_pseudoinverse(task_jacobian, IK_DAMPING)
+    qdot_task = task_jacobian_pinv @ task_velocity
+
+    nullspace_enabled = bool(
+        enable_nullspace_posture
+        and teleop_mode == "position_only"
     )
-    qdot_raw = task_jacobian.T @ np.linalg.solve(
-        regularized,
-        task_velocity,
-    )
+    if nullspace_enabled:
+        if q_posture_reference is None:
+            raise ValueError("q_posture_reference is required for null-space IK")
+        if q_posture_reference.shape != q_current.shape:
+            raise ValueError(
+                "q_posture_reference shape does not match q_current"
+            )
+        q_error_posture = q_posture_reference - q_current
+        qdot_posture_raw = NULLSPACE_GAIN * q_error_posture
+        null_projector = (
+            np.eye(q_current.shape[0])
+            - task_jacobian_pinv @ task_jacobian
+        )
+        qdot_null = null_projector @ qdot_posture_raw
+    else:
+        qdot_null = np.zeros_like(qdot_task)
+
+    qdot_total = qdot_task + qdot_null
+    finite_values = {
+        "J": task_jacobian,
+        "J_pinv": task_jacobian_pinv,
+        "qdot_task": qdot_task,
+        "qdot_null": qdot_null,
+        "qdot_total": qdot_total,
+    }
+    nonfinite_names = [
+        name for name, value in finite_values.items()
+        if not np.all(np.isfinite(value))
+    ]
+    if nonfinite_names:
+        print(
+            "WARNING: non-finite null-space IK values: "
+            + ", ".join(nonfinite_names)
+        )
+        qdot_total = np.zeros_like(q_current)
 
     qdot_command = np.clip(
-        qdot_raw,
+        qdot_total,
         -MAX_JOINT_SPEED,
         MAX_JOINT_SPEED,
     )
-    saturated = bool(np.max(np.abs(qdot_raw)) > MAX_JOINT_SPEED)
-
-    q_current = data.qpos[qpos_indices].copy()
+    if not np.all(np.isfinite(qdot_command)):
+        print("WARNING: non-finite clipped joint velocity; commanding zero")
+        qdot_command = np.zeros_like(q_current)
+    saturated = bool(np.any(np.abs(qdot_total) > MAX_JOINT_SPEED))
 
     # Use the held actuator command as the integration reference. Using the
     # sagging actual q here would make gravity-induced drift continue when
@@ -497,20 +625,36 @@ def compute_joint_target(
         joint_upper,
     )
 
-    singular_values = np.linalg.svd(task_jacobian, compute_uv=False)
-    condition_number = float(
-        singular_values[0] / max(singular_values[-1], 1e-9)
-    )
+    try:
+        condition_number = float(np.linalg.cond(task_jacobian))
+    except np.linalg.LinAlgError:
+        condition_number = float("inf")
+
+    null_task_leak = float(np.linalg.norm(task_jacobian @ qdot_null))
+    posture_reference_distance = float(
+        np.linalg.norm(
+            q_posture_reference - q_current
+        )
+    ) if q_posture_reference is not None else 0.0
 
     diagnostics = {
         "position_error_m": float(np.linalg.norm(position_error)),
         "orientation_error_deg": float(
             np.degrees(np.linalg.norm(rotation_error))
         ),
-        "raw_max_qdot": float(np.max(np.abs(qdot_raw))),
+        "raw_max_qdot": float(np.max(np.abs(qdot_total))),
         "cmd_max_qdot": float(np.max(np.abs(qdot_command))),
         "qdot_saturated": saturated,
         "jacobian_condition": condition_number,
+        "nullspace_enabled": nullspace_enabled,
+        "nullspace_gain": NULLSPACE_GAIN,
+        "qdot_task_norm": float(np.linalg.norm(qdot_task)),
+        "qdot_null_norm": float(np.linalg.norm(qdot_null)),
+        "qdot_total_norm": float(np.linalg.norm(qdot_total)),
+        "posture_reference_distance": posture_reference_distance,
+        "null_task_leak": null_task_leak,
+        "joint_speed_saturated": saturated,
+        "joint_positions": q_current.copy(),
         "max_q_command_error": float(
             np.max(np.abs(q_target - q_current))
         ),
@@ -683,7 +827,11 @@ def main():
 
     teleop_active = False
     clutch_id = 0
+    target_linear_velocity = np.zeros(3)
     target_angular_velocity = np.zeros(3)
+    target_stopping_speed = 0.0
+    target_desired_linear_speed = 0.0
+    target_snapped_to_command = False
     omy_anchor_position = None
     omy_anchor_rotation = None
     omy_anchor_base_ee_transform = None
@@ -747,6 +895,7 @@ def main():
             fr3_mapped_rotation_delta = np.zeros(3)
             fr3_target_position_delta = np.zeros(3)
             fr3_actual_position_delta = np.zeros(3)
+            target_follow_active = False
 
             if ros_fresh:
                 for address, position in zip(omy_qpos_addresses, omy_target):
@@ -778,6 +927,7 @@ def main():
                     fr3_anchor_position = fr3_command_position.copy()
                     fr3_anchor_rotation = fr3_command_rotation.copy()
                     teleop_active = True
+                    target_linear_velocity = np.zeros(3)
                     target_angular_velocity = np.zeros(3)
                     command_anchor_angle_deg = rotation_distance_deg(
                         fr3_initial_command_rotation,
@@ -845,37 +995,51 @@ def main():
                     fr3_target_rotation,
                     target_linear_speed,
                     target_angular_speed,
+                    target_linear_acceleration,
+                    target_linear_velocity,
                     target_angular_velocity,
+                    target_stopping_speed,
+                    target_desired_linear_speed,
+                    target_snapped_to_command,
                 ) = condition_target(
                     fr3_target_position,
                     fr3_target_rotation,
                     fr3_command_position,
                     fr3_command_rotation,
+                    target_linear_velocity,
                     target_angular_velocity,
                     CONTROL_DT,
                 )
 
-                if not teleop_active:
-                    command_position_gap = np.linalg.norm(
-                        fr3_command_position - fr3_target_position
+                command_position_gap = np.linalg.norm(
+                    fr3_command_position - fr3_target_position
+                )
+                command_rotation_gap = np.linalg.norm(
+                    matrix_to_rotvec(
+                        fr3_command_rotation @ fr3_target_rotation.T
                     )
-                    command_rotation_gap = np.linalg.norm(
-                        matrix_to_rotvec(
-                            fr3_command_rotation @ fr3_target_rotation.T
-                        )
-                    )
-                    if (
-                        command_position_gap < 1e-6
-                        and command_rotation_gap < 1e-4
-                    ):
-                        target_angular_velocity = np.zeros(3)
+                )
+                command_reached = (
+                    command_position_gap < 1e-6
+                    and command_rotation_gap < 1e-4
+                )
+                target_follow_active = teleop_active or not command_reached
+                if not teleop_active and command_reached:
+                    target_linear_velocity = np.zeros(3)
+                    target_angular_velocity = np.zeros(3)
             else:
                 teleop_active = False
                 target_linear_speed = 0.0
                 target_angular_speed = 0.0
+                target_linear_acceleration = np.zeros(3)
+                target_linear_velocity = np.zeros(3)
                 target_angular_velocity = np.zeros(3)
+                target_stopping_speed = 0.0
+                target_desired_linear_speed = 0.0
+                target_snapped_to_command = False
                 fr3_command_position = fr3_target_position.copy()
                 fr3_command_rotation = fr3_target_rotation.copy()
+                target_follow_active = False
 
             if omy_anchor_rotation is None or not ros_fresh or not teleop_active:
                 omy_relative_rotation_deg = 0.0
@@ -899,7 +1063,7 @@ def main():
                 fr3_command_rotation,
             )
 
-            if teleop_active:
+            if target_follow_active:
                 q_target, diagnostics = compute_joint_target(
                     fr3_model,
                     fr3_data,
@@ -914,12 +1078,15 @@ def main():
                     jacp,
                     jacr,
                     CONTROL_DT,
+                    teleop_mode=TELEOP_MODE,
+                    enable_nullspace_posture=ENABLE_NULLSPACE_POSTURE,
+                    q_posture_reference=q_home,
                 )
                 hold_q_target = q_target.copy()
             else:
                 # Do not recompute the command from sagging q_current while
-                # gravity acts. Hold the last position target until teleop
-                # resumes; this keeps the simulated FR3 at its posture.
+                # gravity acts. Once the conditioned target has converged,
+                # hold the last actuator command until teleop resumes.
                 q_target = hold_q_target.copy()
                 diagnostics = {
                     "position_error_m": 0.0,
@@ -928,6 +1095,21 @@ def main():
                     "cmd_max_qdot": 0.0,
                     "qdot_saturated": False,
                     "jacobian_condition": 0.0,
+                    "nullspace_enabled": False,
+                    "nullspace_gain": NULLSPACE_GAIN,
+                    "qdot_task_norm": 0.0,
+                    "qdot_null_norm": 0.0,
+                    "qdot_total_norm": 0.0,
+                    "posture_reference_distance": float(
+                        np.linalg.norm(
+                            q_home - fr3_data.qpos[fr3_qpos_indices]
+                        )
+                    ),
+                    "null_task_leak": 0.0,
+                    "joint_speed_saturated": False,
+                    "joint_positions": fr3_data.qpos[
+                        fr3_qpos_indices
+                    ].copy(),
                     "max_q_command_error": float(
                         np.max(np.abs(q_target - fr3_data.qpos[fr3_qpos_indices]))
                     ),
@@ -1070,17 +1252,68 @@ def main():
                         command_target_rotation_gap_deg
                     ),
                     "position_error_mm": 1000.0 * diagnostics["position_error_m"],
+                    "position_error": diagnostics["position_error_m"],
                     "orientation_error_deg": diagnostics["orientation_error_deg"],
                     "target_linear_speed_mps": target_linear_speed,
+                    "target_linear_speed": target_linear_speed,
+                    "target_linear_acceleration_x_mps2": (
+                        target_linear_acceleration[0]
+                    ),
+                    "target_linear_acceleration_y_mps2": (
+                        target_linear_acceleration[1]
+                    ),
+                    "target_linear_acceleration_z_mps2": (
+                        target_linear_acceleration[2]
+                    ),
+                    "target_linear_acceleration_norm_mps2": float(
+                        np.linalg.norm(target_linear_acceleration)
+                    ),
+                    "target_linear_acceleration_x": (
+                        target_linear_acceleration[0]
+                    ),
+                    "target_linear_acceleration_y": (
+                        target_linear_acceleration[1]
+                    ),
+                    "target_linear_acceleration_z": (
+                        target_linear_acceleration[2]
+                    ),
+                    "target_linear_acceleration_norm": float(
+                        np.linalg.norm(target_linear_acceleration)
+                    ),
+                    "stopping_speed": target_stopping_speed,
+                    "desired_linear_speed": target_desired_linear_speed,
+                    "snapped_to_command": int(target_snapped_to_command),
+                    "control_dt": CONTROL_DT,
                     "target_angular_speed_radps": target_angular_speed,
                     "raw_max_qdot_radps": diagnostics["raw_max_qdot"],
                     "cmd_max_qdot_radps": diagnostics["cmd_max_qdot"],
                     "qdot_saturated": int(diagnostics["qdot_saturated"]),
+                    "nullspace_enabled": int(
+                        diagnostics["nullspace_enabled"]
+                    ),
+                    "nullspace_gain": diagnostics["nullspace_gain"],
+                    "qdot_task_norm": diagnostics["qdot_task_norm"],
+                    "qdot_null_norm": diagnostics["qdot_null_norm"],
+                    "qdot_total_norm": diagnostics["qdot_total_norm"],
+                    "posture_reference_distance": diagnostics[
+                        "posture_reference_distance"
+                    ],
+                    "null_task_leak": diagnostics["null_task_leak"],
+                    "joint_speed_saturated": int(
+                        diagnostics["joint_speed_saturated"]
+                    ),
                     "jacobian_condition": diagnostics["jacobian_condition"],
                     "max_q_command_error_rad": diagnostics[
                         "max_q_command_error"
                     ],
                     "deadline_misses": deadline_misses,
+                    "fr3_joint_1": diagnostics["joint_positions"][0],
+                    "fr3_joint_2": diagnostics["joint_positions"][1],
+                    "fr3_joint_3": diagnostics["joint_positions"][2],
+                    "fr3_joint_4": diagnostics["joint_positions"][3],
+                    "fr3_joint_5": diagnostics["joint_positions"][4],
+                    "fr3_joint_6": diagnostics["joint_positions"][5],
+                    "fr3_joint_7": diagnostics["joint_positions"][6],
                 })
 
             if now - last_print >= 1.0 / PRINT_HZ:
@@ -1102,6 +1335,17 @@ def main():
                     f"qdot={diagnostics['cmd_max_qdot']:.3f} rad/s | "
                     f"cond={diagnostics['jacobian_condition']:.1f}"
                 )
+                if diagnostics["nullspace_enabled"]:
+                    print(
+                        "[Nullspace] "
+                        f"gain={diagnostics['nullspace_gain']:.3f} | "
+                        f"posture_dist="
+                        f"{diagnostics['posture_reference_distance']:.4f} | "
+                        f"qdot_task_norm={diagnostics['qdot_task_norm']:.4f} | "
+                        f"qdot_null_norm={diagnostics['qdot_null_norm']:.4f} | "
+                        f"null_task_leak={diagnostics['null_task_leak']:.4e} | "
+                        f"saturated={diagnostics['joint_speed_saturated']}"
+                    )
                 last_print = now
 
             if now - last_rate_report >= 1.0:

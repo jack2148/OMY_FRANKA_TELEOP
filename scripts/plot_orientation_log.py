@@ -178,6 +178,78 @@ def plot_signed_orientation_diagnostics(rows, time_s, csv_path):
     print(f"saved: {output_path}")
 
 
+def plot_target_acceleration(rows, time_s, csv_path):
+    teleop_active = values(rows, "teleop_active") > 0.5
+    target_speed = values(rows, "target_linear_speed_mps")
+    linear_accel_limit = 2.0
+    vector_fields = (
+        "target_linear_acceleration_x_mps2",
+        "target_linear_acceleration_y_mps2",
+        "target_linear_acceleration_z_mps2",
+    )
+    has_vector_acceleration = all(
+        field in rows[0] for field in vector_fields
+    )
+
+    figure, axes = plt.subplots(1, 2, figsize=(13, 4), sharex=True)
+    figure.suptitle(f"Target Linear Acceleration Limit\n{csv_path.name}")
+
+    axes[0].plot(time_s, target_speed, label="target linear speed")
+    shade_inactive_intervals(axes[0], time_s, teleop_active)
+    axes[0].set_ylabel("Speed [m/s]")
+    axes[0].set_xlabel("Time [s]")
+    axes[0].grid(True)
+    axes[0].legend()
+
+    if has_vector_acceleration:
+        labels = ("X", "Y", "Z")
+        colors = ("tab:red", "tab:green", "tab:blue")
+        for field, label, color in zip(vector_fields, labels, colors):
+            axes[1].plot(
+                time_s,
+                values(rows, field),
+                color=color,
+                label=f"target acceleration {label}",
+            )
+        axes[1].plot(
+            time_s,
+            values(rows, "target_linear_acceleration_norm_mps2"),
+            color="black",
+            linewidth=1.2,
+            label="target acceleration norm",
+        )
+    else:
+        axes[1].plot(
+            time_s,
+            np.gradient(target_speed, time_s),
+            label="estimated target acceleration",
+        )
+    axes[1].axhline(
+        linear_accel_limit,
+        color="tab:red",
+        linestyle="--",
+        label="+MAX_TARGET_LINEAR_ACCEL",
+    )
+    axes[1].axhline(
+        -linear_accel_limit,
+        color="tab:red",
+        linestyle="--",
+        label="-MAX_TARGET_LINEAR_ACCEL",
+    )
+    shade_inactive_intervals(axes[1], time_s, teleop_active)
+    axes[1].set_ylabel("Acceleration [m/s²]")
+    axes[1].set_xlabel("Time [s]")
+    axes[1].grid(True)
+    axes[1].legend()
+
+    figure.tight_layout()
+    output_path = csv_path.with_name(
+        f"{csv_path.stem}_target_acceleration.png"
+    )
+    figure.savefig(output_path, dpi=160)
+    print(f"saved: {output_path}")
+
+
 def main():
     csv_path = resolve_csv_path()
     png_path = csv_path.with_suffix(".png")
@@ -276,6 +348,7 @@ def main():
 
     plot_signed_position_diagnostics(rows, time_s, csv_path)
     plot_signed_orientation_diagnostics(rows, time_s, csv_path)
+    plot_target_acceleration(rows, time_s, csv_path)
 
 
 if __name__ == "__main__":
