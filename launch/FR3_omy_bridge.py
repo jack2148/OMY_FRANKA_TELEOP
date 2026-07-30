@@ -83,7 +83,7 @@ ORIENTATION_AXIS_MAP = np.array([
     [0.0, 0.0, -1.0],
 ])
 
-TELEOP_MODE = "position_only"
+TELEOP_MODE = "orientation_only"
 SUPPORTED_TELEOP_MODES = {
     "position_only",
     "orientation_only",
@@ -100,8 +100,8 @@ MAX_TARGET_LINEAR_ACCEL = 2.0        # m/s^2
 POSITION_SNAP_ERROR = 1e-6           # m
 POSITION_SNAP_SPEED = 1e-3           # m/s
 MAX_TARGET_ANGULAR_SPEED = 2.0      # rad/s
-MAX_TARGET_ANGULAR_ACCEL = 2.0      # rad/s^2
-TARGET_ROTATION_KP = 4.0             # 1/s, target conditioning
+MAX_TARGET_ANGULAR_ACCEL = 4.0      # rad/s^2
+TARGET_ROTATION_KP = 6.0             # 1/s, target conditioning
 ROTATION_SNAP_ERROR = 1e-4           # rad
 
 # Task-space feedback used to generate a desired Cartesian twist.
@@ -434,6 +434,7 @@ def condition_target(
 
     if error_angle < ROTATION_SNAP_ERROR:
         next_rotation = desired_rotation.copy()
+        limited_delta_angular_velocity = -previous_angular_velocity
         angular_velocity = np.zeros(3)
     else:
         direction = rotation_error / error_angle
@@ -449,11 +450,13 @@ def condition_target(
         delta_angular_velocity = (
             desired_angular_velocity - previous_angular_velocity
         )
-        delta_angular_velocity = limit_norm(
+        limited_delta_angular_velocity = limit_norm(
             delta_angular_velocity,
             MAX_TARGET_ANGULAR_ACCEL * dt,
         )
-        angular_velocity = previous_angular_velocity + delta_angular_velocity
+        angular_velocity = (
+            previous_angular_velocity + limited_delta_angular_velocity
+        )
         rotation_step = angular_velocity * dt
         next_rotation = (
             rotvec_to_matrix(rotation_step)
@@ -462,6 +465,9 @@ def condition_target(
 
     linear_speed = float(np.linalg.norm(position_step) / max(dt, 1e-9))
     angular_speed = float(np.linalg.norm(angular_velocity))
+    commanded_angular_acceleration = (
+        limited_delta_angular_velocity / max(dt, 1e-9)
+    )
     return (
         next_position,
         next_rotation,
@@ -473,6 +479,7 @@ def condition_target(
         linear_stopping_speed,
         desired_linear_speed,
         snapped_to_command,
+        commanded_angular_acceleration,
     )
 
 
@@ -832,6 +839,7 @@ def main():
     target_stopping_speed = 0.0
     target_desired_linear_speed = 0.0
     target_snapped_to_command = False
+    target_angular_acceleration = np.zeros(3)
     omy_anchor_position = None
     omy_anchor_rotation = None
     omy_anchor_base_ee_transform = None
@@ -1001,6 +1009,7 @@ def main():
                     target_stopping_speed,
                     target_desired_linear_speed,
                     target_snapped_to_command,
+                    target_angular_acceleration,
                 ) = condition_target(
                     fr3_target_position,
                     fr3_target_rotation,
@@ -1037,6 +1046,7 @@ def main():
                 target_stopping_speed = 0.0
                 target_desired_linear_speed = 0.0
                 target_snapped_to_command = False
+                target_angular_acceleration = np.zeros(3)
                 fr3_command_position = fr3_target_position.copy()
                 fr3_command_rotation = fr3_target_rotation.copy()
                 target_follow_active = False
@@ -1285,6 +1295,31 @@ def main():
                     "snapped_to_command": int(target_snapped_to_command),
                     "control_dt": CONTROL_DT,
                     "target_angular_speed_radps": target_angular_speed,
+                    "target_angular_speed": target_angular_speed,
+                    "target_angular_acceleration_x_radps2": (
+                        target_angular_acceleration[0]
+                    ),
+                    "target_angular_acceleration_y_radps2": (
+                        target_angular_acceleration[1]
+                    ),
+                    "target_angular_acceleration_z_radps2": (
+                        target_angular_acceleration[2]
+                    ),
+                    "target_angular_acceleration_norm_radps2": float(
+                        np.linalg.norm(target_angular_acceleration)
+                    ),
+                    "target_angular_acceleration_x": (
+                        target_angular_acceleration[0]
+                    ),
+                    "target_angular_acceleration_y": (
+                        target_angular_acceleration[1]
+                    ),
+                    "target_angular_acceleration_z": (
+                        target_angular_acceleration[2]
+                    ),
+                    "target_angular_acceleration_norm": float(
+                        np.linalg.norm(target_angular_acceleration)
+                    ),
                     "raw_max_qdot_radps": diagnostics["raw_max_qdot"],
                     "cmd_max_qdot_radps": diagnostics["cmd_max_qdot"],
                     "qdot_saturated": int(diagnostics["qdot_saturated"]),

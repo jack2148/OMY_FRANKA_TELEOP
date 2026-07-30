@@ -250,6 +250,89 @@ def plot_target_acceleration(rows, time_s, csv_path):
     print(f"saved: {output_path}")
 
 
+def plot_target_angular_dynamics(rows, time_s, csv_path):
+    teleop_active = values(rows, "teleop_active") > 0.5
+    angular_speed = values_any(
+        rows,
+        "target_angular_speed",
+        "target_angular_speed_radps",
+    )
+    acceleration_fields = (
+        "target_angular_acceleration_x",
+        "target_angular_acceleration_y",
+        "target_angular_acceleration_z",
+    )
+    acceleration_fields_rad = tuple(
+        f"{field}_radps2" for field in acceleration_fields
+    )
+    if all(field in rows[0] for field in acceleration_fields):
+        selected_fields = acceleration_fields
+        norm_field = "target_angular_acceleration_norm"
+    elif all(field in rows[0] for field in acceleration_fields_rad):
+        selected_fields = acceleration_fields_rad
+        norm_field = "target_angular_acceleration_norm_radps2"
+    else:
+        selected_fields = None
+
+    figure, axes = plt.subplots(1, 2, figsize=(13, 4), sharex=True)
+    figure.suptitle(f"Target Angular Speed and Acceleration\n{csv_path.name}")
+
+    axes[0].plot(time_s, angular_speed, label="target angular speed")
+    shade_inactive_intervals(axes[0], time_s, teleop_active)
+    axes[0].set_ylabel("Angular speed [rad/s]")
+    axes[0].set_xlabel("Time [s]")
+    axes[0].grid(True)
+    axes[0].legend()
+
+    if selected_fields is not None:
+        labels = ("X", "Y", "Z")
+        colors = ("tab:red", "tab:green", "tab:blue")
+        for field, label, color in zip(selected_fields, labels, colors):
+            axes[1].plot(
+                time_s,
+                values(rows, field),
+                color=color,
+                label=f"target angular acceleration {label}",
+            )
+        axes[1].plot(
+            time_s,
+            values(rows, norm_field),
+            color="black",
+            linewidth=1.2,
+            label="target angular acceleration norm",
+        )
+    else:
+        axes[1].plot(
+            time_s,
+            np.gradient(angular_speed, time_s),
+            label="estimated angular acceleration",
+        )
+    axes[1].axhline(
+        2.0,
+        color="tab:red",
+        linestyle="--",
+        label="+MAX_TARGET_ANGULAR_ACCEL",
+    )
+    axes[1].axhline(
+        -2.0,
+        color="tab:red",
+        linestyle="--",
+        label="-MAX_TARGET_ANGULAR_ACCEL",
+    )
+    shade_inactive_intervals(axes[1], time_s, teleop_active)
+    axes[1].set_ylabel("Angular acceleration [rad/s²]")
+    axes[1].set_xlabel("Time [s]")
+    axes[1].grid(True)
+    axes[1].legend()
+
+    figure.tight_layout()
+    output_path = csv_path.with_name(
+        f"{csv_path.stem}_target_angular_dynamics.png"
+    )
+    figure.savefig(output_path, dpi=160)
+    print(f"saved: {output_path}")
+
+
 def main():
     csv_path = resolve_csv_path()
     png_path = csv_path.with_suffix(".png")
@@ -349,6 +432,7 @@ def main():
     plot_signed_position_diagnostics(rows, time_s, csv_path)
     plot_signed_orientation_diagnostics(rows, time_s, csv_path)
     plot_target_acceleration(rows, time_s, csv_path)
+    plot_target_angular_dynamics(rows, time_s, csv_path)
 
 
 if __name__ == "__main__":
