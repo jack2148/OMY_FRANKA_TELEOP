@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -eo pipefail
+
+# Native OMY-L100 -> MuJoCo FR3 teleoperation scene.
+# The FR3 scene (including the front collision-test wall) lives in the
+# teleoperation repository, so this command is intentionally separate from
+# ./run, which launches the block-push task used for dataset collection.
+
+teleop_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+port_name="${OMY_PORT:-/dev/ttyUSB0}"
+launch_file="$teleop_root/launch/fr3_omy_sync.py"
+fr3_scene="$teleop_root/mujoco_menagerie/franka_fr3/scene.xml"
+
+if [[ ! -f "$launch_file" ]]; then
+  echo "simul: teleop launch not found: $launch_file" >&2
+  exit 1
+fi
+
+if [[ ! -f "$fr3_scene" ]]; then
+  echo "simul: FR3 scene not found: $fr3_scene" >&2
+  exit 1
+fi
+
+if ! grep -q 'name="fr3_front_wall"' "$fr3_scene"; then
+  echo "simul: warning: front wall is not present in $fr3_scene" >&2
+fi
+
+if [[ -f /opt/ros/humble/setup.bash ]]; then
+  # shellcheck disable=SC1091
+  source /opt/ros/humble/setup.bash
+fi
+if [[ -f "$HOME/franka_ros2_ws/install/setup.bash" ]]; then
+  # Provides franka_msgs for the simulation RobotState adapter.
+  # shellcheck disable=SC1091
+  source "$HOME/franka_ros2_ws/install/setup.bash"
+fi
+if [[ -f "$teleop_root/open_manipulator_omy/install/setup.bash" ]]; then
+  # shellcheck disable=SC1091
+  source "$teleop_root/open_manipulator_omy/install/setup.bash"
+fi
+
+# Route MuJoCo's virtual wrist F/T sensor through the official
+# FrankaRobotState/o_f_ext_hat_k input path.  This keeps simulation and real
+# hardware consumers identical; no haptic torque is generated here.
+export SIMULATED_FRANKA_STATE=1
+export SIMULATED_FRANKA_STATE_TOPIC="${SIMULATED_FRANKA_STATE_TOPIC:-/fr3/simulated_robot_state}"
+export SIMULATED_FRANKA_STATE_HZ="${SIMULATED_FRANKA_STATE_HZ:-100}"
+export FRANKA_ROBOT_STATE_TOPIC="$SIMULATED_FRANKA_STATE_TOPIC"
+
+# ROS setup scripts may reference unset variables; enable nounset afterward.
+set -u
+
+echo "Starting native OMY -> MuJoCo FR3 simulation"
+echo "FR3 scene: $fr3_scene"
+echo "OMY port:  $port_name"
+echo "Close the MuJoCo viewer or press Ctrl-C to stop."
+
+cd "$teleop_root"
+exec /usr/bin/python3 "$launch_file" "port_name:=$port_name" "$@"

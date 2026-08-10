@@ -13,6 +13,7 @@ For a real FR3, use the robot real-time interface and its measured period.
 """
 
 import csv
+import sys
 import threading
 import time
 from pathlib import Path
@@ -23,17 +24,26 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
+from std_msgs.msg import UInt8
+
+
+# Keep the collision layer independent from ROS/current control.  The bridge
+# only consumes its read-only contact result for now.
+ROOT = Path(__file__).resolve().parents[1]
+COLLISION_SRC = ROOT / "src"
+if str(COLLISION_SRC) not in sys.path:
+    sys.path.insert(0, str(COLLISION_SRC))
+from fr3_collision_feedback import Fr3CollisionMonitor  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
 # Paths and runtime options
 # ---------------------------------------------------------------------------
 
-ROOT = Path(__file__).resolve().parents[1]
 OMY_MODEL_PATH = ROOT / "robotis_mujoco_menagerie" / "robotis_omy" / "scene.xml"
 FR3_MODEL_PATH = ROOT / "mujoco_menagerie" / "franka_fr3" / "scene.xml"
 
-ENABLE_VIEWER = True
+ENABLE_VIEWER = False
 ENABLE_LOGGING = True
 ENABLE_MAPPING_DEBUG_LOGS = False
 ENABLE_OMY_INTERNAL_DEBUG_LOGS = False
@@ -41,8 +51,8 @@ ENABLE_NULLSPACE_DEBUG_LOGS = False
 
 CONTROL_HZ = 1000.0
 CONTROL_DT = 1.0 / CONTROL_HZ
-VIEWER_HZ = 30.0
 LOG_HZ = 100.0
+VIEWER_HZ = 30.0
 PRINT_HZ = 1.0
 ROS_TIMEOUT_S = 0.20
 
@@ -131,6 +141,7 @@ class OmyPose(Node):
         self.joint_positions = joint_positions
         self.state_lock = state_lock
         self.trigger_position = 0.0
+        self.gripper_command = 0.0
         self.last_message_time = 0.0
         self.has_joint_state = False
 
@@ -140,6 +151,23 @@ class OmyPose(Node):
             self.joint_state_callback,
             10,
         )
+        self.gripper_subscription = self.create_subscription(
+            UInt8,
+            "/fr3/gripper_command",
+            self.gripper_command_callback,
+            10,
+        )
+        self.gripper_publisher = self.create_publisher(
+            UInt8,
+            "/fr3/gripper_command",
+            10,
+        )
+
+    def gripper_command_callback(self, message):
+        with self.state_lock:
+            self.gripper_command = float(message.data)
+        state = "open" if message.data else "closed"
+        print(f"FR3 gripper command: {state} (ctrl={message.data})", flush=True)
 
     def joint_state_callback(self, message):
         received = dict(zip(message.name, message.position))
@@ -827,6 +855,9 @@ def main():
         keyframe_id(fr3_model, "home"),
     )
     mujoco.mj_forward(fr3_model, fr3_data)
+    collision_monitor = Fr3CollisionMonitor()
+    collision_feedback = collision_monitor.update(fr3_model, fr3_data)
+    last_wall_contact = collision_feedback.wall_contact
     fr3_base_body_id = body_id(fr3_model, FR3_BASE_BODY_NAME)
     fr3_ee_site_id = site_id(fr3_model, FR3_EE_SITE_NAME)
 
@@ -865,9 +896,11 @@ def main():
         [fr3_model.actuator(f"fr3_joint{i}").id for i in range(1, 8)],
         dtype=int,
     )
+    fr3_gripper_actuator_id = fr3_model.actuator("fr3_gripper").id
 
     q_home = fr3_data.qpos[fr3_qpos_indices].copy()
     fr3_data.ctrl[fr3_actuator_indices] = q_home
+    fr3_data.ctrl[fr3_gripper_actuator_id] = 0.0
     mujoco.mj_forward(fr3_model, fr3_data)
 
     fr3_target_position, fr3_target_rotation = read_site_pose(
@@ -923,8 +956,27 @@ def main():
     run_id = time.strftime("%Y%m%d_%H%M%S")
     log_path = ROOT / "logs" / f"refactored_teleop_{run_id}.csv"
 
+    def viewer_key_callback(keycode):
+        if keycode != ord(" "):
+            return
+        with state_lock:
+            ros_node.gripper_command = (
+                0.0 if ros_node.gripper_command >= 127.5 else 255.0
+            )
+            command = int(ros_node.gripper_command)
+        ros_node.gripper_publisher.publish(UInt8(data=command))
+        state = "closed" if command == 0 else "open"
+        print(
+            f"FR3 gripper Space toggle: {state} (ctrl={command})",
+            flush=True,
+        )
+
     viewer_context = (
-        mujoco.viewer.launch_passive(fr3_model, fr3_data)
+        mujoco.viewer.launch_passive(
+            fr3_model,
+            fr3_data,
+            key_callback=viewer_key_callback,
+        )
         if ENABLE_VIEWER
         else None
     )
@@ -951,6 +1003,7 @@ def main():
             with state_lock:
                 omy_target = joint_positions.copy()
                 trigger_position = ros_node.trigger_position
+                gripper_command = ros_node.gripper_command
                 last_message_time = ros_node.last_message_time
                 has_joint_state = ros_node.has_joint_state
 
@@ -1195,10 +1248,32 @@ def main():
                 }
 
             fr3_data.ctrl[fr3_actuator_indices] = q_target
+            fr3_data.ctrl[fr3_gripper_actuator_id] = gripper_command
             mujoco.mj_step(fr3_model, fr3_data)
+            # Read-only collision feedback.  No resistance force, torque, or
+            # current is sent to OMY at this stage.
+            collision_feedback = collision_monitor.update(fr3_model, fr3_data)
+            if collision_feedback.wall_contact != last_wall_contact:
+                state = "ON" if collision_feedback.wall_contact else "OFF"
+                print(
+                    f"FR3 wall collision {state} | "
+                    f"force={collision_feedback.force_world}"
+                )
+                last_wall_contact = collision_feedback.wall_contact
             fr3_actual_position, fr3_actual_rotation = read_site_pose(
                 fr3_data,
                 fr3_ee_site_id,
+            )
+            now = time.perf_counter()
+            # Tracking diagnostics.  These are measured after mj_step and do
+            # not alter the command or apply any collision resistance.
+            target_actual_error = fr3_target_position - fr3_actual_position
+            command_actual_error = fr3_command_position - fr3_actual_position
+            command_target_gap = fr3_command_position - fr3_target_position
+            omy_state_age = (
+                max(0.0, now - last_message_time)
+                if has_joint_state
+                else float("inf")
             )
             fr3_command_session_rotvec = matrix_to_rotvec(
                 fr3_command_rotation @ fr3_initial_command_rotation.T
@@ -1221,7 +1296,6 @@ def main():
                     fr3_actual_position - fr3_anchor_position
                 )
 
-            now = time.perf_counter()
             step_index += 1
             cycles_since_report += 1
 
@@ -1257,6 +1331,22 @@ def main():
                     "fr3_actual_position_x": fr3_actual_position[0],
                     "fr3_actual_position_y": fr3_actual_position[1],
                     "fr3_actual_position_z": fr3_actual_position[2],
+                    "fr3_target_error_x_m": target_actual_error[0],
+                    "fr3_target_error_y_m": target_actual_error[1],
+                    "fr3_target_error_z_m": target_actual_error[2],
+                    "fr3_target_error_norm_m": float(
+                        np.linalg.norm(target_actual_error)
+                    ),
+                    "fr3_command_error_x_m": command_actual_error[0],
+                    "fr3_command_error_y_m": command_actual_error[1],
+                    "fr3_command_error_z_m": command_actual_error[2],
+                    "fr3_command_error_norm_m": float(
+                        np.linalg.norm(command_actual_error)
+                    ),
+                    "fr3_command_target_gap_norm_m": float(
+                        np.linalg.norm(command_target_gap)
+                    ),
+                    "omy_state_age_s": omy_state_age,
                     "fr3_command_rotvec_x": fr3_command_session_rotvec[0],
                     "fr3_command_rotvec_y": fr3_command_session_rotvec[1],
                     "fr3_command_rotvec_z": fr3_command_session_rotvec[2],
@@ -1300,6 +1390,10 @@ def main():
                     ],
                     "joint_speed_saturated": int(
                         diagnostics["joint_speed_saturated"]
+                    ),
+                    "fr3_wall_contact": int(collision_feedback.wall_contact),
+                    "fr3_contact_force_norm_n": float(
+                        np.linalg.norm(collision_feedback.force_world)
                     ),
                     "jacobian_condition": diagnostics["jacobian_condition"],
                     "deadline_misses": deadline_misses,
@@ -1397,7 +1491,10 @@ def main():
                     f"qdot={diagnostics['cmd_max_qdot']:.3f} rad/s | "
                     f"cond={diagnostics['jacobian_condition']:.1f} | "
                     f"task_res={diagnostics['task_residual_norm']:.4f} | "
-                    f"sat={diagnostics['joint_speed_saturated']}"
+                    f"sat={diagnostics['joint_speed_saturated']} | "
+                    f"wall={int(collision_feedback.wall_contact)} | "
+                    f"track_err={1000.0 * np.linalg.norm(target_actual_error):.2f} mm | "
+                    f"state_age={1000.0 * omy_state_age:.1f} ms"
                 )
                 last_print = now
 
