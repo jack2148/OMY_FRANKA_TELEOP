@@ -1,5 +1,58 @@
 # OMY-L100 → MuJoCo FR3 Teleoperation
 
+Physical-leader-to-simulated-follower teleoperation for Cartesian manipulation research.
+
+## Overview
+
+This repository reads a physical OMY-L100 leader through ROS 2 Humble, computes its Cartesian pose with OMY forward kinematics, and retargets that motion to a Franka FR3 model simulated in MuJoCo. The controller supports position-only, orientation-only, and full-pose operation through target conditioning, velocity-level damped least-squares inverse kinematics, and optional null-space posture control.
+
+The validated scope is MuJoCo free-space teleoperation with a physical OMY-L100 leader. Physical Franka FR3 deployment, contact manipulation, gripper control, and production real-time guarantees are outside the current claim.
+
+## Key Contributions
+
+- Cartesian retargeting from OMY-L100 leader motion to FR3 end-effector targets.
+- Runtime clutch anchoring and held-command continuity for continuous relative motion.
+- 6D task-space to 7-DoF velocity DLS IK.
+- Null-space posture regulation for the redundant FR3 configuration.
+- Independent position/orientation mappings with selectable teleoperation modes.
+- Target velocity/acceleration conditioning, joint-speed limiting, and runtime diagnostics.
+
+## Results
+
+### Verified behavior
+
+- Position-only, orientation-only, and full-pose teleoperation modes are implemented.
+- Full-pose control combines position and rotational Jacobians into a 6×7 DLS task.
+- Runtime clutch anchoring and command continuity are implemented; the bridge records command and target state for MuJoCo-run inspection.
+- Target and actual end-effector pose, tracking error, target dynamics, and IK/qdot diagnostics can be written to per-run CSV logs and visualized with repository plotting tools.
+- The bridge uses `CONTROL_HZ=1000` as the nominal simulation/control target. This is a configured target rate, not a measured hard-real-time guarantee.
+- Quantitative hardware-FR3 performance and randomized/generalization benchmarks have not been evaluated.
+
+These verified behaviors characterize the current OMY-L100 → MuJoCo FR3 free-space setup and should not be interpreted as physical-FR3 hardware performance.
+
+## System Architecture
+
+```text
+OMY-L100 hardware
+    ↓ ROS 2 /leader/joint_states
+OMY forward kinematics
+    ↓
+Runtime clutch anchor and relative command
+    ↓
+Position / orientation retargeting
+    ↓
+Target conditioning
+    ↓
+6D task-space → 7-DoF velocity DLS IK
+    + optional null-space posture control
+    ↓
+MuJoCo Franka FR3
+```
+
+---
+
+## Setup & Operation Guide (Korean)
+
 실제 OMY-L100 leader의 ROS 2 joint state를 받아 MuJoCo OMY FK로 Cartesian
 pose를 계산하고, MuJoCo FR3에 position/orientation target을 전달하는
 teleoperation 저장소다.
@@ -28,18 +81,25 @@ omy_franka_teleop/
 │   └── omy_EEposes.py          # OMY EE pose 확인용 legacy script
 ├── scripts/
 │   ├── omy_sim_bridge.py       # OMY joint state → OMY MuJoCo sync legacy bridge
-│   ├── plot_orientation_log.py # teleoperation CSV plot 생성
+│   ├── plot_orientation_log.py # teleoperation CSV diagnostics plot 생성
 │   └── test_fr3_joint_isolation.py # FR3 단일 joint 시각 점검
 ├── config/
 │   └── omy_sim_sync.yaml       # OMY simulation sync 설정 참고 파일
-├── robotis_mujoco_menagerie/
+├── robotis_mujoco_menagerie/   # external / locally prepared OMY model dependency
 │   └── robotis_omy/            # OMY MuJoCo model
-├── mujoco_menagerie/
+├── mujoco_menagerie/           # external / locally prepared model dependency
 │   └── franka_fr3/              # FR3 MuJoCo model
-├── open_manipulator_omy/        # ROS 2 OMY package workspace
-├── logs/                        # 실행별 CSV와 plot
+├── open_manipulator_omy/        # external / locally prepared ROS 2 workspace
+├── logs/                        # runtime-generated CSV와 plot
 └── docs/                        # 개발/디버깅 문서와 이미지
 ```
+
+External / locally prepared dependencies:
+- ROBOTIS OMY packages/models
+- MuJoCo Menagerie Franka FR3 model
+- `open_manipulator_omy` ROS 2 workspace
+
+These dependencies are not tracked in `origin/main`; prepare them locally before running the bridge.
 
 ### 현재 main bridge의 데이터 흐름
 
@@ -60,6 +120,10 @@ launch/FR3_omy_bridge.py
 `FR3_omy_bridge.py`는 OMY model을 FK 용도로 사용하고, FR3 model은 target
 tracking과 actuator dynamics에 사용한다. OMY ROS topic은
 `/leader/joint_states`이며, trigger는 `rh_r1_joint`다.
+
+실행을 종료하면 `logs/refactored_teleop_YYYYMMDD_HHMMSS.csv`가 생성된다.
+CSV에는 `fr3_target_position_*`, `fr3_actual_position_*`와 각 pose의
+회전 벡터가 100 Hz로 저장된다.
 
 ## 1. ROS workspace 준비
 
@@ -158,8 +222,8 @@ bridge가 기대하는 주요 joint 이름은 다음과 같다.
 joint1, joint2, joint3, joint4, joint5, joint6, rh_r1_joint
 ```
 
-현재 확인된 leader controller update rate와 bridge control rate는 서로 다른
-개념이다. bridge source의 nominal control rate는 `CONTROL_HZ=1000`이고,
+public main bridge의 nominal control target은 `CONTROL_HZ=1000`이며,
+이는 실제 measured loop rate나 hard real-time 1 kHz 실행을 의미하지 않는다.
 실제 ROS message rate는 `ros2 topic hz` 결과로 별도 확인한다.
 
 ## 3. 현재 OMY → FR3 teleoperation 실행
@@ -256,8 +320,8 @@ cd /home/chan/omy_franka_teleop
 특정 CSV를 지정하려면:
 
 ```bash
-/usr/bin/python3 scripts/plot_orientation_log.py \
-  logs/refactored_teleop_20260730_170937.csv
+CSV_PATH="$(find logs -maxdepth 1 -type f -name 'refactored_teleop_*.csv' | sort | tail -n 1)"
+/usr/bin/python3 scripts/plot_orientation_log.py "$CSV_PATH"
 ```
 
 plot은 CSV 옆에 생성되며, position/orientation signed diagnostics와 summary
@@ -265,7 +329,7 @@ plot을 포함할 수 있다. CSV header가 오래된 실행 파일이면 일부
 figure가 생략될 수 있다. 이 경우 CSV header를 먼저 확인한다.
 
 ```bash
-head -n 2 logs/refactored_teleop_20260730_170937.csv
+head -n 2 "$CSV_PATH"
 ```
 
 ## 6. FR3 model 단독 점검
@@ -333,6 +397,6 @@ cat /sys/bus/usb-serial/devices/ttyUSB0/latency_timer
 ## 주의사항
 
 현재 bridge는 MuJoCo 검증용 Python loop다. `CONTROL_HZ=1000`은 nominal
-simulation/control setting이며 Python process가 hard real-time이라는 뜻이
-아니다. 실제 FR3에 연결하기 전에는 별도의 robot interface, safety limit,
+simulation/control target이며 실제 measured loop rate나 hard real-time 1 kHz
+실행을 의미하지 않는다. 실제 FR3에 연결하기 전에는 별도의 robot interface, safety limit,
 watchdog, collision policy 및 hardware validation이 필요하다.
