@@ -12,7 +12,7 @@ The validated scope is MuJoCo free-space teleoperation with a physical OMY-L100 
 
 - Cartesian retargeting from OMY-L100 leader motion to FR3 end-effector targets.
 - Runtime clutch anchoring and held-command continuity for continuous relative motion.
-- 6D task-space to 7-DoF velocity DLS IK.
+- Velocity-level damped least-squares IK for a 6D task on the redundant 7-DoF FR3.
 - Null-space posture regulation for the redundant FR3 configuration.
 - Independent position/orientation mappings with selectable teleoperation modes.
 - Target velocity/acceleration conditioning, joint-speed limiting, and runtime diagnostics.
@@ -22,10 +22,10 @@ The validated scope is MuJoCo free-space teleoperation with a physical OMY-L100 
 ### Verified behavior
 
 - Position-only, orientation-only, and full-pose teleoperation modes are implemented.
-- Full-pose control combines position and rotational Jacobians into a 6×7 DLS task.
+- Full-pose control combines position and rotational Jacobians into a 6D task-space DLS system for the 7-DoF FR3.
 - Runtime clutch anchoring and command continuity are implemented; the bridge records command and target state for MuJoCo-run inspection.
 - Target and actual end-effector pose, tracking error, target dynamics, and IK/qdot diagnostics can be written to per-run CSV logs and visualized with repository plotting tools.
-- The bridge uses `CONTROL_HZ=1000` as the nominal simulation/control target. This is a configured target rate, not a measured hard-real-time guarantee.
+- The module documents a nominal 1 kHz simulation/control target. This is a configured target rate, not a measured hard-real-time guarantee.
 - Quantitative hardware-FR3 performance and randomized/generalization benchmarks have not been evaluated.
 
 These verified behaviors characterize the current OMY-L100 → MuJoCo FR3 free-space setup and should not be interpreted as physical-FR3 hardware performance.
@@ -43,7 +43,7 @@ Position / orientation retargeting
     ↓
 Target conditioning
     ↓
-6D task-space → 7-DoF velocity DLS IK
+Velocity-level DLS IK for a 6D task on the redundant 7-DoF FR3
     + optional null-space posture control
     ↓
 MuJoCo Franka FR3
@@ -61,6 +61,11 @@ teleoperation 저장소다.
 teleoperation이다. 실제 FR3 제어, PushT, gripper, dataset 수집 pipeline은
 아직 이 README의 실행 대상이 아니다.
 
+Demonstration recording and policy-learning experiments are maintained separately
+in [dp-act-policy-study](https://github.com/jack2148/dp-act-policy-study). 그 repo와의
+inter-repo bridge에서 ZeroMQ를 사용할 수 있지만, 이 repository의 core
+teleoperation architecture는 ROS 2 기반이다.
+
 ## 환경
 
 - Ubuntu 22.04
@@ -68,6 +73,102 @@ teleoperation이다. 실제 FR3 제어, PushT, gripper, dataset 수집 pipeline�
 - Python 3.10 계열
 - MuJoCo Python package
 - 실제 leader 사용 시 OMY-L100 및 USB serial connection
+
+README의 shell 예제에서만 checkout 위치를 가리키기 위해 다음 변수를 사용한다.
+이 변수 자체를 `simul`이나 `teleop`이 읽는 것은 아니다.
+
+```bash
+export TELEOP_ROOT=/path/to/OMY_FRANKA_TELEOP
+cd "$TELEOP_ROOT"
+```
+
+## 외부 의존성
+
+아래 항목은 이 repository의 public main에 tracked되어 있지 않다. clean clone에는
+자동으로 포함되지 않으므로, 각 경로를 local machine에 준비해야 한다.
+
+- **MuJoCo Menagerie Franka FR3 model** — `mujoco_menagerie/franka_fr3/scene.xml`.
+  External dependency — path must be configured locally. 이 repository에는 해당
+  model의 clone URL이나 설치 명령이 정의되어 있지 않다.
+- **ROBOTIS OMY MuJoCo model** — `robotis_mujoco_menagerie/robotis_omy/scene.xml`.
+  External dependency — path must be configured locally. 이 repository에는 해당
+  model의 clone URL이나 설치 명령이 정의되어 있지 않다.
+- **ROBOTIS OMY ROS 2 workspace** — `open_manipulator_omy/` 아래에 준비된
+  `open_manipulator_bringup` 및 leader launch 파일. 기존 문서에 기록된 준비 방법은
+  다음과 같다.
+
+  ```bash
+  cd "$TELEOP_ROOT"
+  git clone -b feature-omy-humble \
+    https://github.com/ROBOTIS-GIT/open_manipulator.git \
+    open_manipulator_omy
+  cd open_manipulator_omy
+  source /opt/ros/humble/setup.bash
+  rosdep install --from-paths . --ignore-src --rosdistro humble -r -y
+  colcon build --symlink-install --event-handlers console_direct+
+  ```
+
+- **ROS 2 Humble**와 ROS package `rclpy`, `sensor_msgs`, `std_msgs`, `launch`,
+  `ament_index_python` — `simul`, `teleop`, 통합 launch, bridge가 사용한다.
+- **`franka_ros2_ws` / `franka_msgs`** — `simul`이
+  `$HOME/franka_ros2_ws/install/setup.bash`가 있을 때 source한다. External
+  dependency — path must be configured locally. 이 repository에는 clone URL이나
+  설치 명령이 정의되어 있지 않다.
+- **Python packages** — `mujoco`, `numpy`가 bridge와 model 점검에 필요하고,
+  `matplotlib`은 CSV plotting에 필요하다. `requirements.txt`는 제공되지 않는다.
+
+필수 model 파일과 ROS workspace가 준비되지 않은 상태에서 `simul` 또는
+`launch/FR3_omy_bridge.py`를 실행하면 clean clone만으로는 재현되지 않는다.
+
+## 사용자-facing entrypoint
+
+- `./simul` — OMY leader bringup과 현재 FR3 MuJoCo teleoperation을 통합 실행한다.
+  `OMY_PORT` 환경변수로 serial port를 지정하며 기본값은 `/dev/ttyUSB0`이다.
+  `SIMULATED_FRANKA_STATE_TOPIC`, `SIMULATED_FRANKA_STATE_HZ`도 script가 읽으며
+  기본값은 각각 `/fr3/simulated_robot_state`, `100`이다. 이 script는 ROS Humble setup을
+  source하고, 존재하면 `franka_ros2_ws`와 `open_manipulator_omy`의 setup도
+  source한다. `SIMULATED_FRANKA_STATE=1`을 설정하고
+  `FRANKA_ROBOT_STATE_TOPIC`을 `SIMULATED_FRANKA_STATE_TOPIC`과 같게 만든 뒤
+  `/usr/bin/python3 launch/fr3_omy_sync.py`를 호출한다.
+- `./teleop [PORT]` — OMY-L100 leader bringup만 실행한다. `PORT`의 기본값은
+  `/dev/ttyUSB0`이며 별도 user-configurable environment variable은 없다. ROS
+  Humble과 `open_manipulator_bringup`을 source한 뒤
+  `ros2 launch open_manipulator_bringup omy_l100_leader_ai.launch.py`를 호출한다.
+- 개발/디버그 모드에서는 leader를 별도 실행한 뒤
+  `/usr/bin/python3 launch/FR3_omy_bridge.py`를 직접 실행할 수 있다.
+
+### 빠른 시작
+
+외부 model과 ROS workspace를 준비한 뒤 통합 teleoperation은 다음처럼 실행한다.
+
+```bash
+cd "$TELEOP_ROOT"
+OMY_PORT=/dev/ttyUSB0 ./simul
+```
+
+leader bringup만 별도 실행하려면 다음을 사용한다.
+
+```bash
+cd "$TELEOP_ROOT"
+./teleop /dev/ttyUSB0
+```
+
+위 wrapper의 checkout-path 제한이 적용되므로, 임의 경로의 clean clone에서는
+아래 direct/debug 실행 경로를 사용하기 전에 관련 source 경로를 확인해야 한다.
+
+`simul`이 호출하는 `launch/fr3_omy_sync.py`와 root `teleop` script에는 현재
+OMY workspace/checkout 위치가 source에 고정된 부분이 있다. 따라서 임의의 clone
+경로에서 두 wrapper가 모두 즉시 재현되는지는 보장되지 않는다. 이 P0에서는
+code logic을 바꾸지 않고 이 제한만 명시한다.
+
+## REVIEW_NOTE
+
+- External dependency — path must be configured locally: MuJoCo Menagerie FR3,
+  ROBOTIS OMY MuJoCo model, `open_manipulator_omy`, and `franka_ros2_ws` /
+  `franka_msgs`의 local path는 이 repository가 자동으로 준비하지 않는다.
+- `simul`과 `teleop`이 호출하는 integration path에는 현재 fixed local path가
+  남아 있다. 이 P0에서는 code logic을 변경하지 않았으므로, arbitrary checkout
+  경로에서 wrapper가 바로 동작하는 문제는 후속 작업으로 남긴다.
 
 ## 전체 구조
 
@@ -85,21 +186,21 @@ omy_franka_teleop/
 │   └── test_fr3_joint_isolation.py # FR3 단일 joint 시각 점검
 ├── config/
 │   └── omy_sim_sync.yaml       # OMY simulation sync 설정 참고 파일
-├── robotis_mujoco_menagerie/   # external / locally prepared OMY model dependency
-│   └── robotis_omy/            # OMY MuJoCo model
-├── mujoco_menagerie/           # external / locally prepared model dependency
-│   └── franka_fr3/              # FR3 MuJoCo model
-├── open_manipulator_omy/        # external / locally prepared ROS 2 workspace
-├── logs/                        # runtime-generated CSV와 plot
-└── docs/                        # 개발/디버깅 문서와 이미지
+├── logs/                        # tracked reference figures; runtime CSV도 생성됨
+├── src/                         # collision feedback 및 관련 source
+├── tests/                       # tracked tests
+├── docs/                        # tracked 개발/디버깅 문서와 이미지
+├── simul                       # OMY + FR3 통합 실행 wrapper
+├── teleop                      # OMY leader bringup wrapper
+├── README.md
+├── MUJOCO_LOG.TXT
+└── Adobe Express - IMG_8690.gif
 ```
 
-External / locally prepared dependencies:
-- ROBOTIS OMY packages/models
-- MuJoCo Menagerie Franka FR3 model
-- `open_manipulator_omy` ROS 2 workspace
-
-These dependencies are not tracked in `origin/main`; prepare them locally before running the bridge.
+`robotis_mujoco_menagerie/`, `mujoco_menagerie/`, `open_manipulator_omy/`는
+`.gitignore` 대상인 external/local dependency이므로 위 tracked tree에 포함하지
+않는다. `results/`와 branch-specific research WIP도 public main tree의 일부로
+표시하지 않는다.
 
 ### 현재 main bridge의 데이터 흐름
 
@@ -113,7 +214,7 @@ launch/FR3_omy_bridge.py
     ├─ runtime clutch anchor
     ├─ position/orientation mapping
     ├─ Cartesian target conditioning
-    ├─ 6D task → 7DoF velocity DLS IK
+    ├─ velocity-level DLS IK for a 6D task on the redundant 7-DoF FR3
     └─ FR3 MuJoCo actuator command
 ```
 
@@ -130,7 +231,7 @@ CSV에는 `fr3_target_position_*`, `fr3_actual_position_*`와 각 pose의
 저장소 루트에서 ROS 2와 OMY workspace를 source한다.
 
 ```bash
-cd /home/chan/omy_franka_teleop
+cd "$TELEOP_ROOT"
 source /opt/ros/humble/setup.bash
 source open_manipulator_omy/install/setup.bash
 ```
@@ -138,7 +239,7 @@ source open_manipulator_omy/install/setup.bash
 처음 clone하는 경우 OMY package workspace를 준비한다.
 
 ```bash
-cd /home/chan/omy_franka_teleop
+cd "$TELEOP_ROOT"
 git clone -b feature-omy-humble \
   https://github.com/ROBOTIS-GIT/open_manipulator.git \
   open_manipulator_omy
@@ -147,7 +248,7 @@ git clone -b feature-omy-humble \
 그 다음 workspace를 빌드한다.
 
 ```bash
-cd /home/chan/omy_franka_teleop/open_manipulator_omy
+cd "$TELEOP_ROOT/open_manipulator_omy"
 source /opt/ros/humble/setup.bash
 rosdep install --from-paths . --ignore-src --rosdistro humble -r -y
 colcon build --symlink-install --event-handlers console_direct+
@@ -158,7 +259,7 @@ source install/setup.bash
 
 ```bash
 source /opt/ros/humble/setup.bash
-source /home/chan/omy_franka_teleop/open_manipulator_omy/install/setup.bash
+source "$TELEOP_ROOT/open_manipulator_omy/install/setup.bash"
 ```
 
 필요한 주요 Ubuntu/ROS package가 없다면 다음을 설치한다.
@@ -197,7 +298,7 @@ plot을 만들려면 matplotlib도 필요하다.
 
 ```bash
 source /opt/ros/humble/setup.bash
-source /home/chan/omy_franka_teleop/open_manipulator_omy/install/setup.bash
+source "$TELEOP_ROOT/open_manipulator_omy/install/setup.bash"
 
 ros2 launch open_manipulator_bringup omy_l100_leader_ai.launch.py \
   port_name:=/dev/ttyUSB0 \
@@ -210,7 +311,7 @@ serial device가 다르면 `port_name`을 바꾼다. leader가 정상적으로 �
 
 ```bash
 source /opt/ros/humble/setup.bash
-source /home/chan/omy_franka_teleop/open_manipulator_omy/install/setup.bash
+source "$TELEOP_ROOT/open_manipulator_omy/install/setup.bash"
 
 ros2 topic echo /leader/joint_states
 ros2 topic hz /leader/joint_states
@@ -222,8 +323,8 @@ bridge가 기대하는 주요 joint 이름은 다음과 같다.
 joint1, joint2, joint3, joint4, joint5, joint6, rh_r1_joint
 ```
 
-public main bridge의 nominal control target은 `CONTROL_HZ=1000`이며,
-이는 실제 measured loop rate나 hard real-time 1 kHz 실행을 의미하지 않는다.
+현재 확인된 leader controller update rate와 bridge control rate는 서로 다른
+개념이다. bridge source의 nominal control rate는 `CONTROL_HZ=1000`이고,
 실제 ROS message rate는 `ros2 topic hz` 결과로 별도 확인한다.
 
 ## 3. 현재 OMY → FR3 teleoperation 실행
@@ -231,7 +332,7 @@ public main bridge의 nominal control target은 `CONTROL_HZ=1000`이며,
 leader를 실행한 terminal은 유지하고, 새 terminal에서 다음을 실행한다.
 
 ```bash
-cd /home/chan/omy_franka_teleop
+cd "$TELEOP_ROOT"
 source /opt/ros/humble/setup.bash
 source open_manipulator_omy/install/setup.bash
 
@@ -258,7 +359,7 @@ CSV가 `logs/refactored_teleop_YYYYMMDD_HHMMSS.csv`로 생성된다.
 leader bringup과 현재 FR3 bridge를 한 번에 실행하려면 다음을 사용한다.
 
 ```bash
-cd /home/chan/omy_franka_teleop
+cd "$TELEOP_ROOT"
 source /opt/ros/humble/setup.bash
 source open_manipulator_omy/install/setup.bash
 
@@ -313,15 +414,15 @@ axis mapping은 자동으로 바뀌지 않는다. position과 orientation mappin
 가장 최근 CSV를 자동 선택하려면:
 
 ```bash
-cd /home/chan/omy_franka_teleop
+cd "$TELEOP_ROOT"
 /usr/bin/python3 scripts/plot_orientation_log.py
 ```
 
 특정 CSV를 지정하려면:
 
 ```bash
-CSV_PATH="$(find logs -maxdepth 1 -type f -name 'refactored_teleop_*.csv' | sort | tail -n 1)"
-/usr/bin/python3 scripts/plot_orientation_log.py "$CSV_PATH"
+/usr/bin/python3 scripts/plot_orientation_log.py \
+  /path/to/generated_teleop_log.csv
 ```
 
 plot은 CSV 옆에 생성되며, position/orientation signed diagnostics와 summary
@@ -329,7 +430,7 @@ plot을 포함할 수 있다. CSV header가 오래된 실행 파일이면 일부
 figure가 생략될 수 있다. 이 경우 CSV header를 먼저 확인한다.
 
 ```bash
-head -n 2 "$CSV_PATH"
+head -n 2 /path/to/generated_teleop_log.csv
 ```
 
 ## 6. FR3 model 단독 점검
@@ -337,7 +438,7 @@ head -n 2 "$CSV_PATH"
 teleoperation을 실행하지 않고 FR3 관절 하나의 방향과 joint axis를 확인한다.
 
 ```bash
-cd /home/chan/omy_franka_teleop
+cd "$TELEOP_ROOT"
 /usr/bin/python3 scripts/test_fr3_joint_isolation.py \
   --joint 6 \
   --amplitude 0.25 \
@@ -367,7 +468,7 @@ git diff --check
 leader topic이 보이지 않으면 다음을 순서대로 확인한다.
 
 ```bash
-ros2 topic list | rg leader
+ros2 topic list | grep leader
 ros2 topic echo /leader/joint_states
 ros2 topic hz /leader/joint_states
 ```
@@ -397,6 +498,6 @@ cat /sys/bus/usb-serial/devices/ttyUSB0/latency_timer
 ## 주의사항
 
 현재 bridge는 MuJoCo 검증용 Python loop다. `CONTROL_HZ=1000`은 nominal
-simulation/control target이며 실제 measured loop rate나 hard real-time 1 kHz
-실행을 의미하지 않는다. 실제 FR3에 연결하기 전에는 별도의 robot interface, safety limit,
+simulation/control setting이며 Python process가 hard real-time이라는 뜻이
+아니다. 실제 FR3에 연결하기 전에는 별도의 robot interface, safety limit,
 watchdog, collision policy 및 hardware validation이 필요하다.
