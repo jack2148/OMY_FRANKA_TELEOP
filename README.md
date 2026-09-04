@@ -1,6 +1,8 @@
-# OMY-L100 → MuJoCo FR3 Teleoperation
+# OMY-L100 → Franka FR3 Teleoperation
 
-Physical-leader-to-simulated-follower teleoperation for Cartesian manipulation research.
+A ROS 2 teleoperation platform using a physical OMY-L100 as the leader and a
+Franka FR3 simulated in MuJoCo as the follower for robot manipulation,
+demonstration collection, and robot-learning experiments.
 
 ## Overview
 
@@ -47,6 +49,57 @@ optional null-space posture control
     ↓
 MuJoCo Franka FR3
 ```
+
+## Haptic Feedback — In Progress
+
+The teleoperation platform is currently being extended with
+contact-force-based haptic feedback for manipulation experiments.
+
+Current development direction:
+
+```text
+MuJoCo contact / interaction forces
+    ↓
+force processing / scaling
+    ↓
+Jacobian-transpose mapping
+    ↓
+OMY-L100 joint torque feedback
+```
+
+This module is currently under development.
+
+## Demonstrations and Robot Learning
+
+Teleoperation demonstrations are collected for manipulation experiments,
+converted to LeRobot format, and used for ACT and Diffusion Policy training
+and evaluation:
+
+```text
+Teleoperation demonstrations
+    ↓
+LeRobot dataset conversion
+    ↓
+ACT / Diffusion Policy training and evaluation
+```
+
+Trajectory coverage, demonstration-distribution analysis, and data-efficient
+demonstration collection are current research directions. Related policy
+experiments are documented in [dp-act-policy-study](https://github.com/jack2148/dp-act-policy-study).
+
+## Project Status
+
+| Component | Status |
+|---|---|
+| OMY-L100 → MuJoCo FR3 teleoperation | Implemented |
+| Cartesian pose retargeting | Implemented |
+| DLS inverse kinematics | Implemented |
+| Null-space control | Implemented |
+| Demonstration collection | Implemented |
+| LeRobot dataset conversion | Implemented |
+| ACT / Diffusion Policy experiments | Implemented |
+| Haptic feedback | In progress |
+| Data-efficient demonstration collection | In progress |
 
 ## Verified Scope
 
