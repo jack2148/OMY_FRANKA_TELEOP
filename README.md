@@ -1,5 +1,13 @@
 # OMY-L100 → Franka FR3 Teleoperation
 
+<p align="center">
+  <img src="docs/images/teleop/development/position_only_cartesian_teleoperation_compressed.gif" width="850">
+</p>
+
+<p align="center">
+  <b>Physical OMY-L100 → Cartesian retargeting → DLS IK → MuJoCo Franka FR3</b>
+</p>
+
 A ROS 2 teleoperation platform using a physical OMY-L100 as the leader and a
 Franka FR3 simulated in MuJoCo as the follower for robot manipulation,
 demonstration collection, and robot-learning experiments.
