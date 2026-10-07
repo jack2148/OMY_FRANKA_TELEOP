@@ -1,7 +1,7 @@
 # OMY-L100 → Franka FR3 Teleoperation
 
 <p align="center">
-  <img src="docs/images/teleop/development/full_pose_cartesian_teleoperation.gif" width="850">
+  <img src="docs/images/teleop/development/full_pose_cartesian_teleoperation2.gif" width="850">
 </p>
 
 <p align="center">
